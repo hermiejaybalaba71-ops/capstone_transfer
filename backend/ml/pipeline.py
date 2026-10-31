@@ -65,7 +65,7 @@ def _json_safe(value):
 
 
 def _mem_mb() -> tuple[float | None, float | None]:
-    """Current + peak RSS in MB (Linux /proc; None elsewhere).
+    """Current + peak RSS in MB (Linux /proc, Windows GetProcessMemoryInfo).
 
     Render's free instance is 512 MB and a container killed for exceeding it
     dies silently - no traceback reaches the logs. Recording RSS on every event
@@ -81,6 +81,35 @@ def _mem_mb() -> tuple[float | None, float | None]:
                     peak = round(int(line.split()[1]) / 1024, 1)
     except (OSError, ValueError, IndexError):
         pass
+    if current is not None:
+        return current, peak
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class counters(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD),
+                    ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            counters = counters()  # type: ignore[no-redef]
+            counters.cb = ctypes.sizeof(counters)
+            handle = ctypes.windll.kernel32.GetCurrentProcess()
+            ctypes.windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb)
+            current = round(counters.WorkingSetSize / (1024 * 1024), 1)
+            peak = round(counters.PeakWorkingSetSize / (1024 * 1024), 1)
+        except Exception:
+            return None, None
     return current, peak
 
 
