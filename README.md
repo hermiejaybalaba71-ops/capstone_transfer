@@ -7,7 +7,7 @@ and an Administrator review, approve, and notify applicants.
 
 ## Tech Stack
 
-- **Frontend:** Next.js (App Router), React, Tailwind CSS, TypeScript, in `frontend/`
+- **Frontend:** Next.js (App Router), React, Tailwind CSS, TypeScript, in `src/` (repo root)
 - **Backend:** FastAPI and Python, in `backend/`
 - **Database & Auth:** Supabase (PostgreSQL + RLS) — main project + a separate registrar project
 - **ML Ranking:** Python — OCR (RapidOCR / onnxruntime-DirectML) + scikit-learn Random Forest, in `backend/ml/`
@@ -15,11 +15,11 @@ and an Administrator review, approve, and notify applicants.
 ## Project structure
 
 ```text
-frontend/                 # Next.js user interface
-├── src/app/              # Pages and temporary compatibility route adapters
-├── src/components/       # React components
-├── src/lib/              # Frontend utilities and shared TypeScript code
-└── public/               # Static assets
+src/                     # Next.js user interface (repo root)
+├── app/                 # Pages and temporary compatibility route adapters
+├── components/          # React components
+└── lib/                 # Frontend utilities and shared TypeScript code
+public/                  # Static assets
 
 backend/                  # Python server and backend processing
 ├── app/main.py           # FastAPI entrypoint
@@ -33,7 +33,7 @@ tools/                    # Optional Colab and local training utilities
 
 The backend service is available at `http://localhost:8000` and currently exposes
 the ML pipeline at `POST /pipeline`. The Next.js app runs at `http://localhost:3000`.
-The existing `frontend/src/app/api/` files are compatibility adapters for the current
+The existing `src/app/api/` files are compatibility adapters for the current
 UI and will call the FastAPI service as backend endpoints are migrated.
 
 ## Features
@@ -61,11 +61,10 @@ UI and will call the FastAPI service as backend endpoints are migrated.
 ## Getting Started (local)
 
 ```powershell
-cd frontend
 npm install
 npm run dev        # app on http://localhost:3000
 
-cd ..\backend
+cd backend
 py -3 -m pip install -r requirements.txt
 py -3 -m uvicorn app.main:app --reload --port 8000
 ```

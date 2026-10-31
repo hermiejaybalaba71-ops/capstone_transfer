@@ -19,7 +19,6 @@ REPOSITORY_ROOT = PROJECT_ROOT.parent
 ENV_FILES = (
     PROJECT_ROOT / ".env.local",
     REPOSITORY_ROOT / ".env.local",
-    REPOSITORY_ROOT / "frontend" / ".env.local",
 )
 
 # --- model defaults -------------------------------------------------------

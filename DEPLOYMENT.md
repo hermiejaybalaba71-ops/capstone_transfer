@@ -5,7 +5,7 @@ This project is separated into a Next.js frontend and a FastAPI backend. It depl
 
 | Part | Tech | Where it runs |
 |------|------|---------------|
-| Frontend | Next.js + TypeScript in `frontend/` | Vercel service `app` |
+| Frontend | Next.js + TypeScript in `src/` (repo root) | Vercel service `app` |
 | Backend | Python FastAPI in `backend/app/main.py` | Vercel service `ml` |
 | Database | PostgreSQL | Supabase (main + registrar projects) |
 
@@ -47,7 +47,8 @@ git push -u origin main
 2. Click **Add New → Project**.
 3. Select your `scholar-capstone` repo.
 4. Vercel auto-detects Next.js. **Framework: Next.js**.
-5. Set the Vercel **Root Directory** to `frontend`, then under **Environment Variables**, add these values for **Production** (and
+5. Leave the Vercel **Root Directory** at the repo root (it is no longer `frontend` — the app
+   now lives at the root, and `vercel.json` sets `"root": "."`), then under **Environment Variables**, add these values for **Production** (and
    **Preview** if you test preview deployments):
    - `NEXT_PUBLIC_SUPABASE_URL` = your Supabase project URL (`https://xxxx.supabase.co`)
    - `NEXT_PUBLIC_SUPABASE_ANON_KEY` = your anon key
