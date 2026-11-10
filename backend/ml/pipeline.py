@@ -518,6 +518,9 @@ def _ocr_page(path: str, record: dict, page_no: int = 1) -> tuple:
                 "steps": candidate["steps"],
             }
             levels = THRESHOLD_LEVELS if position == 0 else (THRESHOLD_LEVELS[-1],)
+            # Best priority reading so far on this candidate; a partial chain
+            # on the strict pass escalates instead of finalizing (below).
+            deferred_priority = None
             for level_index, threshold in enumerate(levels):
                 record["attempts"] += 1
                 log(
@@ -624,6 +627,33 @@ def _ocr_page(path: str, record: dict, page_no: int = 1) -> tuple:
                     if is_1701_ms
                     else None
                 )
+                # The strict first pass (0.75) often keeps the rank-3 label
+                # while dropping rank 1/2 (57 vs 140 lines on a real sample).
+                # Reporting item 29 when item 23 actually carries a value
+                # would understate the reading, so a chain that starts below
+                # rank 1 escalates to the full-detail pass first - and only
+                # the stricter pass's reading is kept when it finds nothing
+                # better than what was already read.
+                if (
+                    priority is not None
+                    and priority["rank"] > 1
+                    and level_index < len(levels) - 1
+                ):
+                    deferred_priority = priority
+                    log(
+                        f"      page {page_no}: priority rank "
+                        f"{priority['rank']} read at box_thresh={threshold:.2f} "
+                        f"- escalating to complete the priority chain"
+                    )
+                    continue
+                if (
+                    deferred_priority is not None
+                    and (
+                        priority is None
+                        or deferred_priority["rank"] < priority["rank"]
+                    )
+                ):
+                    priority = deferred_priority
                 if priority is not None:
                     extracted = {
                         "value": priority["value"],

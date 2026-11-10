@@ -218,6 +218,148 @@ class OcrMemorySafetyTests(unittest.TestCase):
         self.assertEqual(engine.scan_count, 2)
         self.assertEqual(engine.cell_read_count, 1)
 
+    def test_partial_priority_chain_escalates_to_the_full_detail_pass(self):
+        """0.75 keeps only the rank-3 label - the chain must still end at rank 1."""
+        image = np.zeros((600, 600, 3), dtype=np.uint8)
+        lines = [
+            {"text": "1701-MS 08/24 P1", "score": 0.9, "y": 10, "x": 10, "h": 10},
+            {"text": "23 Total Income Tax Due (Sum of Items 21 and 22)",
+             "score": 0.9, "y": 500, "x": 30, "h": 21},
+            {"text": "29 Total Amount Payable/(Overpayment)",
+             "score": 0.9, "y": 800, "x": 30, "h": 21},
+        ]
+
+        def field(key, label, value):
+            return {
+                "field": key, "label": label, "kind": "tax", "page": 1,
+                "value": value, "confidence": 0.8,
+                "method": "1701_ms_layout_cell", "anchor": label,
+                "amount_line": f"{value:,}",
+            }
+
+        strict_pass = [
+            field("total_amount_payable",
+                  "Item 29 - Total Amount Payable/(Overpayment)", 8_800),
+        ]
+        full_pass = strict_pass + [
+            field("total_income_tax_due", "Item 23 - Total Income Tax Due", 19_000),
+            field("tax_payable_overpayment",
+                  "Item 25 - Tax Payable/(Overpayment)", 17_600),
+        ]
+
+        class FakeEngine:
+            engine_info = {}
+            load_ms = 0.0
+
+            def __init__(self):
+                self.scan_count = 0
+
+            def scan(self, _image, box_thresh, allow_fallback):
+                self.scan_count += 1
+                return {
+                    "lines": lines,
+                    "extracted": None,
+                    "line_count": len(lines),
+                    "avg_confidence": 0.9,
+                    "ocr_ms": 1.0,
+                }
+
+            def extract_1701_ms_compensation_income(self, _image, _lines):
+                return None
+
+            def extract_1701_ms_layout_fields(self, _image, _lines, page_no):
+                return strict_pass if self.scan_count == 1 else full_pass
+
+        engine = FakeEngine()
+        candidate = {"name": "original", "array": image, "steps": ["decode"]}
+        record = {"attempts": 0, "ocr_ms": 0.0, "ocr_value": None, "itr_fields": []}
+
+        with (
+            patch("ml.pipeline.storage.download", return_value=b"x" * 20_000),
+            patch("ml.pipeline.preproc.decode", return_value=(image, {})),
+            patch("ml.pipeline.preproc.image_stats", return_value={}),
+            patch(
+                "ml.pipeline.preproc.build_candidates",
+                return_value=(item for item in [candidate]),
+            ),
+            patch("ml.pipeline.ocr_engine.peek", return_value=engine),
+            patch("ml.pipeline.ocr_engine.shared", return_value=engine),
+            patch("ml.pipeline.log"),
+        ):
+            status, detail = pipeline._ocr_page("test/page1.png", record, page_no=1)
+
+        self.assertEqual((status, detail), ("found", None))
+        # Two OCR passes: the strict one was escalated, not settled for.
+        self.assertEqual(engine.scan_count, 2)
+        self.assertEqual(record["ocr_value"], 19_000)
+        self.assertEqual(record["method"], "1701_ms_priority_1")
+        self.assertEqual(record["priority_rank"], 1)
+        self.assertTrue(record["ocr_cleared"])
+
+    def test_deferred_priority_is_kept_when_the_full_detail_pass_finds_nothing(self):
+        """Escalation may find nothing better - the stricter reading stays."""
+        image = np.zeros((600, 600, 3), dtype=np.uint8)
+        lines = [
+            {"text": "1701-MS 08/24 P1", "score": 0.9, "y": 10, "x": 10, "h": 10},
+            {"text": "29 Total Amount Payable/(Overpayment)",
+             "score": 0.9, "y": 800, "x": 30, "h": 21},
+        ]
+        strict_pass = [{
+            "field": "total_amount_payable",
+            "label": "Item 29 - Total Amount Payable/(Overpayment)",
+            "kind": "tax", "page": 1, "value": 8_800, "confidence": 0.8,
+            "method": "1701_ms_layout_cell", "anchor": lines[1]["text"],
+            "amount_line": "8,800",
+        }]
+
+        class FakeEngine:
+            engine_info = {}
+            load_ms = 0.0
+
+            def __init__(self):
+                self.scan_count = 0
+
+            def scan(self, _image, box_thresh, allow_fallback):
+                self.scan_count += 1
+                return {
+                    "lines": lines,
+                    "extracted": None,
+                    "line_count": len(lines),
+                    "avg_confidence": 0.9,
+                    "ocr_ms": 1.0,
+                }
+
+            def extract_1701_ms_compensation_income(self, _image, _lines):
+                return None
+
+            def extract_1701_ms_layout_fields(self, _image, _lines, page_no):
+                return strict_pass if self.scan_count == 1 else []
+
+        engine = FakeEngine()
+        candidate = {"name": "original", "array": image, "steps": ["decode"]}
+        record = {"attempts": 0, "ocr_ms": 0.0, "ocr_value": None, "itr_fields": []}
+
+        with (
+            patch("ml.pipeline.storage.download", return_value=b"x" * 20_000),
+            patch("ml.pipeline.preproc.decode", return_value=(image, {})),
+            patch("ml.pipeline.preproc.image_stats", return_value={}),
+            patch(
+                "ml.pipeline.preproc.build_candidates",
+                return_value=(item for item in [candidate]),
+            ),
+            patch("ml.pipeline.ocr_engine.peek", return_value=engine),
+            patch("ml.pipeline.ocr_engine.shared", return_value=engine),
+            patch("ml.pipeline.log"),
+        ):
+            status, detail = pipeline._ocr_page("test/page1.png", record, page_no=1)
+
+        self.assertEqual((status, detail), ("found", None))
+        self.assertEqual(engine.scan_count, 2)
+        self.assertEqual(record["ocr_value"], 8_800)
+        self.assertEqual(record["method"], "1701_ms_priority_3")
+        self.assertEqual(record["priority_rank"], 3)
+        self.assertTrue(record["ocr_cleared"])
+
     def test_1701_ms_taxable_compensation_is_not_a_gross_income_substitute(self):
         image = np.zeros((600, 600, 3), dtype=np.uint8)
         lines = [
