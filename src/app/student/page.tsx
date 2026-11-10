@@ -5,7 +5,11 @@ import { useRouter } from "next/navigation";
 import { getSupabase } from "@/lib/supabase/browser";
 import { queryRegistrar } from "@/lib/supabase/registrar";
 import { formatDateTime } from "@/lib/utils";
-import { STATUS_STYLES, NOTIFICATION_TYPE_STYLES } from "@/lib/constants";
+import {
+  STATUS_STYLES,
+  NOTIFICATION_TYPE_STYLES,
+  isItrResubmissionCancellation,
+} from "@/lib/constants";
 import { Badge } from "@/components/ui/badge";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Spinner } from "@/components/ui/spinner";
@@ -37,6 +41,7 @@ interface AppItem {
   application_id: number;
   application_status?: string;
   application_date?: string;
+  remarks?: string | null;
   scholarship_programs?: { scholarship_name?: string };
 }
 
@@ -133,7 +138,7 @@ export default function StudentDashboardPage() {
           .eq("status", "Open"),
         sb
           .from("scholarship_applications")
-          .select("application_id, application_status, application_date, scholarship_programs(scholarship_name)")
+          .select("application_id, application_status, application_date, remarks, scholarship_programs(scholarship_name)")
           .eq("student_id", sid)
           .order("application_date", { ascending: false }),
         sb
@@ -385,9 +390,13 @@ export default function StudentDashboardPage() {
         ) : (
           <div className="mt-3 space-y-3">
             {applications.map((app) => {
-              const info =
-                statusNotes[app.application_status || ""] ||
-                { note: "Your application is being reviewed.", hint: "You will be notified once a decision is made." };
+              const info = isItrResubmissionCancellation(app)
+                ? {
+                    note: "This application was cancelled so you can submit the required ITR pages.",
+                    hint: "Submit a new application with your genuine ITR Page 1 and Page 2.",
+                  }
+                : statusNotes[app.application_status || ""] ||
+                  { note: "Your application is being reviewed.", hint: "You will be notified once a decision is made." };
               return (
                 <div
                   key={app.application_id}

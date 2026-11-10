@@ -196,8 +196,12 @@ export default function BrowseProgramsPage() {
                 <li>Contact Number *</li>
                 <li>Email Address *</li>
                 <li>Disability / Indigenous People Group (optional)</li>
-                <li>Annual Family Income (PHP) *</li>
-                <li>Income Tax Return (ITR) File * — JPG / PNG / PDF, max 10 MB (OCR may auto-detect income)</li>
+                <li>Annual Family Income (PHP) * — enter the amount you declare</li>
+                <li>
+                  Proof of Income / ITR File * — any image (JPG, PNG, HEIC, screenshot) or PDF, max
+                  10 MB. It does not have to be a readable ITR; the Scholarship Office reads and
+                  verifies it (OCR + ML ranking) during review.
+                </li>
               </ul>
               <p className="mt-3 font-bold uppercase tracking-wide text-[#7B1113]">Section 3 — Supporting Documents</p>
               <p className="text-[#6B5458]">Upload clear scans of each required document for your chosen program (JPG, PNG, or PDF, max 10 MB).</p>

@@ -4,7 +4,7 @@ import toast from "react-hot-toast";
 import { useEffect, useMemo, useState } from "react";
 import Image from "next/image";
 import { useRouter } from "next/navigation";
-import { getSupabase } from "@/lib/supabase/browser";
+import { getSupabase, authHeaders } from "@/lib/supabase/browser";
 import { formatDateTime, downloadCsv } from "@/lib/utils";
 import JSZip from "jszip";
 import { Badge } from "@/components/ui/badge";
@@ -157,9 +157,15 @@ export default function AdminDocumentsPage() {
         const uniq = [...new Set(paths.filter((p): p is string => !!p))];
         if (!uniq.length) return;
         // 1) Normal direct signing (works for buckets with proper read policies)
-        const { data, error } = await sb.storage.from(bucket).createSignedUrls(uniq, 3600);
-        if (error) return;
-        for (const item of data) {
+        //    If it errors - e.g. itr-documents has no storage SELECT policy - we
+        //    must NOT bail out: fall through so the service-key route below can
+        //    still produce a link.
+        let direct: Array<{ path?: string; signedUrl?: string | null }> = [];
+        try {
+          const res = await sb.storage.from(bucket).createSignedUrls(uniq, 3600);
+          direct = (res.data || []) as Array<{ path?: string; signedUrl?: string | null }>;
+        } catch { /* fall through to the server route */ }
+        for (const item of direct) {
           if (item?.signedUrl && item?.path) map[item.path] = item.signedUrl;
         }
         // 2) Server-side fallback for buckets whose storage RLS blocks the user's
@@ -169,7 +175,7 @@ export default function AdminDocumentsPage() {
           try {
             const res = await fetch("/api/storage/signed-url", {
               method: "POST",
-              headers: { "Content-Type": "application/json" },
+              headers: { "Content-Type": "application/json", ...(await authHeaders()) },
               body: JSON.stringify({ bucket, paths: missing }),
             });
             if (res.ok) {
@@ -266,7 +272,7 @@ export default function AdminDocumentsPage() {
       try {
         const res = await fetch("/api/storage/signed-url", {
           method: "DELETE",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", ...(await authHeaders()) },
           body: JSON.stringify({ bucket, path }),
         });
         if (!res.ok) setFlash({ type: "err", text: "Record deleted, but the file could not be removed from storage." });
@@ -518,7 +524,7 @@ export default function AdminDocumentsPage() {
                 {studentRows.length} file{studentRows.length === 1 ? "" : "s"} from {studentGroups.length} student{studentGroups.length === 1 ? "" : "s"} &middot;{" "}
                 <span className="font-semibold text-[#7B1113]">{studentGroups.length} row{studentGroups.length === 1 ? "" : "s"} shown</span>
                 {" \u00b7 "}
-                <span className="text-[#6B5458]">One row per student - click View, Download or Delete to open that student's file-selection modal</span>
+                <span className="text-[#6B5458]">One row per student - click View, Download or Delete to open that student&apos;s file-selection modal</span>
               </p>
             </div>
             <div className="flex flex-wrap gap-2">

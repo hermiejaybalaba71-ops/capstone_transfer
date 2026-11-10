@@ -3,13 +3,14 @@ import toast from "react-hot-toast";
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { getSupabase } from "@/lib/supabase/browser";
+import { getSupabase, authHeaders } from "@/lib/supabase/browser";
 import { formatDateTime, downloadCsv } from "@/lib/utils";
 import { STATUS_STYLES, getProgramRequirementDocs, matchRequirementOption } from "@/lib/constants";
 import { autoRejectSiblings } from "@/lib/scholarship";
 import { Badge } from "@/components/ui/badge";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Spinner } from "@/components/ui/spinner";
+import { RowActions } from "@/components/ui/row-actions";
 
 const FILTER_TABS = [
   { key: "", label: "All", active: "bg-[#7B1113] text-white", idle: "text-[#6B5458] hover:bg-[#7B1113]/5 hover:text-[#7B1113]" },
@@ -29,6 +30,7 @@ interface ScholarshipApplication {
   application_date: string;
   application_status: string;
   remarks?: string | null;
+  application_data?: { itr_file?: string | null; itr_file_p2?: string | null } | null;
   scholarship_programs?: { scholarship_name: string; requirements?: string };
   student_accounts?: { given_name: string; last_name: string; student_number: string; program_name: string; year_level?: string; sex?: string; registration_status?: string; account_status?: string };
 }
@@ -162,6 +164,7 @@ export default function ApplicationsPage() {
   const [urlsLoading, setUrlsLoading] = useState(false);
   const [statusDraft, setStatusDraft] = useState<Record<number, { status: string; remarks: string }>>({});
   const [savingId, setSavingId] = useState<number | null>(null);
+  const [deletingApplicationId, setDeletingApplicationId] = useState<number | null>(null);
   const [message, setMessage] = useState("");
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [batchMsg, setBatchMsg] = useState("");
@@ -280,6 +283,13 @@ export default function ApplicationsPage() {
   const appChed = (app: ScholarshipApplication) => chedForms.filter((c) => c.application_id === app.application_id);
   const appDocs = (app: ScholarshipApplication) => docs.filter((d) => d.application_id === app.application_id || d.student_id === app.student_id);
   const appAcads = (app: ScholarshipApplication) => acads.filter((a) => a.student_id === app.student_id);
+  const appItrPages = (app: ScholarshipApplication) => {
+    const legacyPage1 = appChed(app).find((c) => c.income_tax_return)?.income_tax_return;
+    return [
+      { label: "Page 1", path: app.application_data?.itr_file || legacyPage1 },
+      { label: "Page 2", path: app.application_data?.itr_file_p2 },
+    ].filter((page): page is { label: string; path: string } => Boolean(page.path));
+  };
 
   // Requirement compliance for one application: the program's checked requirements
   // (COR / Valid ID / Signature Form / ITR / …) vs what the student actually uploaded.
@@ -294,6 +304,7 @@ export default function ApplicationsPage() {
     if (chedForms.some((c) => c.application_id === app.application_id && !!c.income_tax_return)) {
       present.add("Income Tax Return (ITR)");
     }
+    if (appItrPages(app).length > 0) present.add("Income Tax Return (ITR)");
     const missing = required.filter((r) => !present.has(r));
     return { required, missing, done: required.length - missing.length };
   };
@@ -406,7 +417,7 @@ export default function ApplicationsPage() {
       try {
         const res = await fetch("/api/storage/signed-url", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", ...(await authHeaders()) },
           body: JSON.stringify({ bucket, paths: missing }),
         });
         if (res.ok) {
@@ -421,7 +432,7 @@ export default function ApplicationsPage() {
     await Promise.all([
       signBatch("support-documents", appDocs(app).map((d) => d.file_path)),
       signBatch("academic-records", appAcads(app).map((a) => a.proof_image_path)),
-      signBatch("itr-documents", appChed(app).map((c) => c.income_tax_return)),
+      signBatch("itr-documents", appItrPages(app).map((page) => page.path)),
     ]);
 
     setFileUrls({ ...urls });
@@ -433,6 +444,52 @@ export default function ApplicationsPage() {
     if (!app) return;
     setViewingId(appId);
     loadFileUrls(app);
+  }
+
+  async function deleteApplication(app: ScholarshipApplication) {
+    const studentName = `${app.student_accounts?.given_name || ""} ${app.student_accounts?.last_name || ""}`.trim() || "this student";
+    const programName = app.scholarship_programs?.scholarship_name || "this scholarship";
+    if (!window.confirm(
+      `Delete this application for ${studentName} — ${programName} (${app.application_status})?\n\n` +
+      "Only this application and its application-linked form, documents, ranking, and approval records will be deleted. The student account, scholarship program, and files in storage will remain."
+    )) return;
+
+    setDeletingApplicationId(app.application_id);
+    try {
+      const response = await fetch("/api/admin/delete-application", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(await authHeaders()) },
+        body: JSON.stringify({ application_id: app.application_id }),
+      });
+      const result = (await response.json().catch(() => null)) as {
+        ok?: boolean;
+        error?: string;
+      } | null;
+      if (!response.ok || !result?.ok) {
+        throw new Error(result?.error || "Could not delete the application.");
+      }
+
+      setApplications((current) => current.filter((item) => item.application_id !== app.application_id));
+      setDocs((current) => current.filter((item) => item.application_id !== app.application_id));
+      setChedForms((current) => current.filter((item) => item.application_id !== app.application_id));
+      setSelectedIds((current) => {
+        const next = new Set(current);
+        next.delete(app.application_id);
+        return next;
+      });
+      setStatusDraft((current) => {
+        const next = { ...current };
+        delete next[app.application_id];
+        return next;
+      });
+      if (viewingId === app.application_id) setViewingId(null);
+      setFileUrls({});
+      toast.success("Scholarship application deleted.");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Could not delete the application.");
+    } finally {
+      setDeletingApplicationId(null);
+    }
   }
 
   async function notifyStudent(app: ScholarshipApplication, title: string, message: string) {
@@ -860,48 +917,58 @@ export default function ApplicationsPage() {
             </div>
           </div>
 
-          {/* Status filter row - mirrors the Documents Viewer's type-filter row. */}
+          {/* Status filter - collapsed into one dropdown so it takes a single
+              button of width instead of four pills across the row. */}
           <div className="flex flex-wrap items-center gap-2 border-b border-[#241012]/[0.07] bg-[#FAF7F5]/60 px-5 py-3">
-            {FILTER_TABS.map((tab) => {
-              const count = tab.key === "" ? applications.length : tab.key === "Approved" ? approvedCount : tab.key === "Not Approved" ? notApprovedCount : pendingCount;
-              return (
-                <button
-                  key={tab.key || "all"}
-                  onClick={() => setStatusFilter(tab.key)}
-                  className={`rounded-lg px-3 py-1.5 text-[11px] font-bold transition ${
-                    statusFilter === tab.key
-                      ? `${tab.active} shadow-sm`
-                      : `border border-[#241012]/10 bg-white ${tab.idle}`
-                  }`}
-                >
-                  {tab.label} <span className={statusFilter === tab.key ? "text-white/70" : "text-[#8B7376]"}>{count}</span>
-                </button>
-              );
-            })}
+            <span className="text-[10px] font-bold uppercase tracking-wide text-[#8B7376]">Status</span>
+            <RowActions
+              label={`${FILTER_TABS.find((t) => t.key === statusFilter)?.label ?? "All"} (${
+                statusFilter === "" ? applications.length : statusFilter === "Approved" ? approvedCount : statusFilter === "Not Approved" ? notApprovedCount : pendingCount
+              })`}
+              triggerClassName="rounded-lg border border-[#241012]/10 bg-white px-3 py-1.5 text-[11px] font-bold text-[#241012] transition hover:border-[#7B1113]/40"
+              actions={FILTER_TABS.map((tab) => {
+                const count = tab.key === "" ? applications.length : tab.key === "Approved" ? approvedCount : tab.key === "Not Approved" ? notApprovedCount : pendingCount;
+                return {
+                  label: tab.label,
+                  count,
+                  active: statusFilter === tab.key,
+                  onClick: () => setStatusFilter(tab.key),
+                };
+              })}
+            />
           </div>
 
           {/* Program chips scroll sideways instead of wrapping, so the row stays one
               line no matter how many programs Admin creates - and every chip stays
               clickable. The right-hand fade hints there is more to scroll to. */}
           <div className="relative border-b border-[#241012]/[0.07] bg-[#FAF7F5]/60 px-5 py-2.5">
-            <div className="flex gap-2 overflow-x-auto scroll-smooth pb-1 [-ms-overflow-style:none] [scrollbar-color:#7B111340_transparent] [scrollbar-width:thin] [&::-webkit-scrollbar]:h-1.5 [&::-webkit-scrollbar]:rounded-full [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-[#7B1113]/40 [&::-webkit-scrollbar-track]:bg-transparent">
-              <button
-                onClick={() => setProgramFilter("")}
-                className={`shrink-0 whitespace-nowrap rounded-full px-3 py-1.5 text-[11px] font-bold transition ${programFilter === "" ? "bg-[#7B1113] text-white shadow" : "border border-[#241012]/[0.08] bg-white text-[#241012] hover:border-[#7B1113]/40"}`}
-                title="Show every scholarship program"
-              >
-                📚 All programs ({totalByStatus})
-              </button>
-              {programNames.map((name) => (
-                <button
-                  key={name}
-                  onClick={() => setProgramFilter(programFilter === name ? "" : name)}
-                  className={`max-w-[18rem] shrink-0 truncate whitespace-nowrap rounded-full px-3 py-1.5 text-[11px] font-bold transition ${programFilter === name ? "bg-[#7B1113] text-white shadow" : "border border-[#241012]/[0.08] bg-white text-[#241012] hover:border-[#7B1113]/40"}`}
-                  title={`Show only applications filed under "${name}" (${programCounts[name] ?? 0})`}
-                >
-                  📚 {name} ({programCounts[name] ?? 0})
-                </button>
-              ))}
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-[10px] font-bold uppercase tracking-wide text-[#8B7376]">Program</span>
+              <RowActions
+                label={
+                  programFilter
+                    ? `📚 ${programFilter} (${programCounts[programFilter] ?? 0})`
+                    : `📚 All programs (${totalByStatus})`
+                }
+                menuAlign="left"
+                triggerClassName="max-w-[24rem] truncate rounded-full border border-[#241012]/[0.08] bg-white px-3 py-1.5 text-[11px] font-bold text-[#241012] transition hover:border-[#7B1113]/40"
+                actions={[
+                  {
+                    label: "All programs",
+                    count: totalByStatus,
+                    active: programFilter === "",
+                    title: "Show every scholarship program",
+                    onClick: () => setProgramFilter(""),
+                  },
+                  ...programNames.map((name) => ({
+                    label: name,
+                    count: programCounts[name] ?? 0,
+                    active: programFilter === name,
+                    title: `Show only applications filed under "${name}" (${programCounts[name] ?? 0})`,
+                    onClick: () => setProgramFilter(programFilter === name ? "" : name),
+                  })),
+                ]}
+              />
 
               {/* Import control - sits right in the chip row so a file of
                   previous applications is one click away. The imported rows
@@ -959,10 +1026,6 @@ export default function ApplicationsPage() {
                 </span>
               ))}
             </div>
-            <div
-              aria-hidden="true"
-              className="pointer-events-none absolute inset-y-0 right-0 w-10 bg-gradient-to-l from-[#FAF7F5] via-[#FAF7F5]/70 to-transparent"
-            />
           </div>
 
           {/* Explicit confirmation of what is on screen: which program was picked
@@ -1124,15 +1187,24 @@ export default function ApplicationsPage() {
                           </Badge>
                         </td>
                         <td className={cellCls}>
-                          <div className="flex items-center gap-1.5">
-                            <button
-                              onClick={() => openDetails(app.application_id)}
-                              title={`Open ${studentName}'s form, documents, notify box and status controls`}
-                              className="rounded-md bg-[#7B1113] px-2.5 py-1 text-[10px] font-bold text-white transition hover:bg-[#540111]"
-                            >
-                              View Details
-                            </button>
-                          </div>
+                          <RowActions
+                            actions={[
+                              {
+                                label: "View Details",
+                                primary: true,
+                                title: `Open ${studentName}'s form, documents, notify box and status controls`,
+                                onClick: () => openDetails(app.application_id),
+                              },
+                              {
+                                label: deletingApplicationId === app.application_id ? "Deleting..." : "Delete application",
+                                danger: true,
+                                busy: deletingApplicationId === app.application_id,
+                                disabled: deletingApplicationId !== null,
+                                title: "Delete only this scholarship application and its linked records",
+                                onClick: () => void deleteApplication(app),
+                              },
+                            ]}
+                          />
                         </td>
                       </tr>
                     );
@@ -1315,28 +1387,23 @@ export default function ApplicationsPage() {
                       <div><p className="text-[10px] uppercase tracking-wide text-[#8B7376]">IP Group</p><p className="mt-0.5 font-semibold text-[#241012]">{c.indigenous_people_group || "\u2014"}</p></div>
                       <div><p className="text-[10px] uppercase tracking-wide text-[#8B7376]">Annual Family Income</p><p className="mt-0.5 font-semibold text-[#241012]">&#8369;{Number(c.annual_income_family || 0).toLocaleString()}/yr</p></div>
                       <div>
-                        <p className="text-[10px] uppercase tracking-wide text-[#8B7376]">ITR File</p>
-                        {c.income_tax_return ? (
-                          fileUrls[c.income_tax_return] ? (
-                            <a href={fileUrls[c.income_tax_return]} target="_blank" rel="noreferrer" className="mt-1 inline-flex items-center gap-1.5 rounded-lg bg-[#7B1113] px-3 py-1.5 text-[11px] font-bold text-white shadow-sm transition hover:bg-[#540111]" title="Open the submitted Income Tax Return in a new tab">
-                              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="h-3.5 w-3.5"><path strokeLinecap="round" strokeLinejoin="round" d="M3 10.5h18M3 6h18M12 6v18M10.5 3h3M4.5 21h15a1.5 1.5 0 001.5-1.5V7.5A1.5 1.5 0 0019.5 6h-15A1.5 1.5 0 003 7.5v12A1.5 1.5 0 004.5 21z" /></svg>
-                              View ITR
-                            </a>
-                          ) : urlsLoading ? (
-                            <button type="button" disabled className="mt-1 inline-flex cursor-default items-center gap-1.5 rounded-lg border border-[#7B1113]/30 px-3 py-1.5 text-[11px] font-semibold text-[#8B7376]" title="Signing a secure link...">
-                              <span className="h-3 w-3 animate-spin rounded-full border-2 border-[#7B1113]/30 border-t-[#7B1113]" />
-                              Opening ITR...
-                            </button>
-                          ) : (
-                            <button
-                              type="button"
-                              onClick={() => loadFileUrls(viewingApp)}
-                              className="mt-1 inline-flex items-center gap-1.5 rounded-lg border border-amber-300 bg-amber-50 px-3 py-1.5 text-[11px] font-bold text-amber-700 transition hover:bg-amber-100"
-                              title={`The ITR (${c.income_tax_return.split("/").pop()}) is uploaded but the link could not be created. Click to try again.`}
-                            >
-                              Could not open ITR · Retry
-                            </button>
-                          )
+                        <p className="text-[10px] uppercase tracking-wide text-[#8B7376]">ITR Files</p>
+                        {appItrPages(viewingApp).length ? (
+                          <div className="mt-1 flex flex-col items-start gap-1">
+                            {appItrPages(viewingApp).map((page) => (
+                              fileUrls[page.path] ? (
+                                <a key={page.label} href={fileUrls[page.path]} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1.5 rounded-lg bg-[#7B1113] px-3 py-1.5 text-[11px] font-bold text-white shadow-sm transition hover:bg-[#540111]">
+                                  View ITR {page.label}
+                                </a>
+                              ) : urlsLoading ? (
+                                <span key={page.label} className="text-[10px] font-semibold text-[#8B7376]">Loading ITR {page.label}...</span>
+                              ) : (
+                                <button key={page.label} type="button" onClick={() => loadFileUrls(viewingApp)} className="text-[10px] font-semibold text-amber-700 hover:underline">
+                                  Retry ITR {page.label}
+                                </button>
+                              )
+                            ))}
+                          </div>
                         ) : <p className="mt-0.5 font-semibold text-[#241012]">{"\u2014"}</p>}
                       </div>
                     </div>

@@ -4,12 +4,12 @@ import toast from "react-hot-toast";
 import { useEffect, useState, useMemo, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { getSupabase } from "@/lib/supabase/browser";
-import { queryRegistrar } from "@/lib/supabase/registrar";
 import { formatDate } from "@/lib/utils";
 import { STATUS_STYLES, PROGRAMS, YEAR_LEVELS } from "@/lib/constants";
 import { Badge } from "@/components/ui/badge";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Spinner } from "@/components/ui/spinner";
+import { RowActions } from "@/components/ui/row-actions";
 
 // Compact display for long degree names: "Bachelor of Science in Information
 // Technology" -> "BSIT" — full name shown on hover / title.
@@ -136,10 +136,36 @@ export default function UserManagementPage() {
   async function handleRoleChange(user: User, newRole: string) {
     setMessage("");
     setMessageType("");
-    const sb = getSupabase();
-    const { error } = await sb.from("users").update({ role: newRole }).eq("user_id", user.user_id);
-    if (error) { setMessage(error.message); setMessageType("err"); return; }
-    setUsers((prev) => prev.map((u) => u.user_id === user.user_id ? { ...u, role: newRole } : u));
+    try {
+      const sb = getSupabase();
+      const { data: { session } } = await sb.auth.getSession();
+      if (!session) throw new Error("Session expired. Please log in again.");
+
+      const response = await fetch("/api/admin/update-user-role", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({ user_id: user.user_id, role: newRole }),
+      });
+      const result = (await response.json().catch(() => null)) as {
+        ok?: boolean;
+        error?: string;
+      } | null;
+      if (!response.ok || !result?.ok) {
+        throw new Error(result?.error || "Could not update this account's role.");
+      }
+
+      setUsers((prev) => prev.map((u) => u.user_id === user.user_id ? { ...u, role: newRole } : u));
+      if (newRole === "Faculty") {
+        setStudents((prev) => prev.filter((student) => student.user_id !== user.user_id));
+      }
+      toast.success(`Role updated to ${newRole}.`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not update this account's role.");
+      setMessageType("err");
+    }
   }
 
   async function handleToggleStatus(user: User) {
@@ -156,71 +182,70 @@ export default function UserManagementPage() {
     setUsers((prev) => prev.map((u) => u.user_id === user.user_id ? { ...u, status: nextStatus } : u));
   }
 
-  async function handleVerify(user: User, student: StudentDetail | undefined) {
+  /**
+   * Admin approval for a brand-new student account.
+   * Delegates to /api/admin/approve-student, which:
+   *   1. creates the simulated Registrar record (student id, full name,
+   *      program, year level, sex, birthdate),
+   *   2. adds the enrollment row + 8 subjects with grades (GPA), and
+   *   3. marks the account Verified so the student can apply.
+   * The existing registration flow that saves the account to the MAIN
+   * database is untouched.
+   */
+  async function handleApprove(user: User, student: StudentDetail | undefined) {
     setMessage("");
     setMessageType("");
     if (!student || !student.student_number) {
-      setMessage("No student record linked to this account, so it cannot be verified against the Registrar.");
+      setMessage("This account has no student number. Click Edit, add one, then approve again.");
       setMessageType("err");
       return;
     }
-    setVerifyingId(user.user_id);
-    const regLookup = await queryRegistrar<{ student_id: number; registration_status?: string }>((rsb) =>
-      rsb
-        .from("registrar_students")
-        .select("*")
-        .eq("student_number", student.student_number.trim())
-        .maybeSingle()
+
+    const ok = window.confirm(
+      `Approve ${student.last_name}, ${student.given_name} (${student.student_number})?\n\n` +
+        `This generates their simulated Registrar record — student details, enrollment, ` +
+        `8 subjects with grades and GPA — and marks the account Verified so they can apply for scholarships.`
     );
+    if (!ok) return;
 
-    if (regLookup.error) {
-      setVerifyingId(null);
-      setMessage(`Registrar lookup failed: ${regLookup.error.message}`);
-      setMessageType("err");
-      return;
-    }
-
-    const regRows = regLookup.data;
-    let isEnrolled = false;
-    if (regRows) {
-      isEnrolled = !!regRows.registration_status && regRows.registration_status === "Enrolled";
-      if (!isEnrolled) {
-        const enrollLookup = await queryRegistrar<{ enrollment_status: string }[]>((rsb) =>
-          rsb
-            .from("registrar_enrollment")
-            .select("enrollment_status")
-            .eq("student_id", regRows.student_id)
-            .eq("enrollment_status", "Enrolled")
-            .limit(1)
-        );
-        if (!enrollLookup.error) isEnrolled = !!enrollLookup.data?.length;
+    setVerifyingId(user.user_id);
+    try {
+      const sb = getSupabase();
+      const { data: sessionData } = await sb.auth.getSession();
+      const token = sessionData.session?.access_token;
+      if (!token) {
+        setMessage("Session expired. Please log in again.");
+        setMessageType("err");
+        return;
       }
-    }
 
-    if (!regRows || !isEnrolled) {
+      const res = await fetch("/api/admin/approve-student", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ user_id: user.user_id }),
+      });
+      const payload = await res.json().catch(() => ({ error: "Invalid server response." }));
+
+      if (!res.ok || payload.error) {
+        setMessage(payload.error || "Approval failed.");
+        setMessageType("err");
+        return;
+      }
+
+      setStudents((prev) =>
+        prev.map((s) =>
+          s.student_id === student.student_id ? { ...s, registration_status: "Verified" } : s
+        )
+      );
+      setMessage(payload.message);
+      setMessageType("ok");
+      toast.success("Student approved — simulated registrar record generated.");
+    } catch (err: unknown) {
+      setMessage(err instanceof Error ? err.message : "Approval failed.");
+      setMessageType("err");
+    } finally {
       setVerifyingId(null);
-      setMessage(`No enrolled record found in the Registrar database for student number ${student.student_number}. The account stays Unverified.`);
-      setMessageType("err");
-      return;
     }
-
-    const sb = getSupabase();
-    const { error: updateErr } = await sb
-      .from("student_accounts")
-      .update({ registration_status: "Verified" })
-      .eq("student_id", student.student_id);
-
-    setVerifyingId(null);
-
-    if (updateErr) {
-      setMessage(`Record found in Registrar but could not update status: ${updateErr.message}`);
-      setMessageType("err");
-      return;
-    }
-
-    setStudents((prev) => prev.map((s) => s.student_id === student.student_id ? { ...s, registration_status: "Verified" } : s));
-    setMessage(`Verified from Registrar — ${student.given_name} ${student.last_name} matched an enrolled record (${student.student_number}).`);
-    setMessageType("ok");
   }
 
   function openEdit(user: User, student: StudentDetail | undefined) {
@@ -473,7 +498,7 @@ export default function UserManagementPage() {
                       </>
                     )}
                     <th className={`${cellCls} font-bold`}>Created</th>
-                    <th className={`${cellCls} w-64 font-bold`}>Actions</th>
+                    <th className={`${cellCls} w-28 font-bold`}>Actions</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -531,45 +556,43 @@ export default function UserManagementPage() {
                         )}
                         <td className={`${cellCls} whitespace-nowrap text-[#8B7376]`}>{formatDate(u.created_at)}</td>
                         <td className={cellCls}>
-                          <div className="flex flex-row flex-wrap items-center gap-1.5">
-                            <button
-                              onClick={() => openEdit(u, s)}
-                              disabled={isMe}
-                              className="rounded-md bg-[#7B1113] px-2.5 py-1 text-[10px] font-bold text-white transition hover:bg-[#540111] disabled:cursor-not-allowed disabled:opacity-50"
-                              title="Update this account's details"
-                            >
-                              Edit
-                            </button>
-                            {s && s.registration_status !== "Verified" && (
-                              <button
-                                onClick={() => handleVerify(u, s)}
-                                disabled={isMe || verifyingId === u.user_id}
-                                className="rounded-md border border-[#7B1113]/25 px-2.5 py-1 text-[10px] font-bold text-[#7B1113] transition hover:bg-[#7B1113]/5 disabled:cursor-not-allowed disabled:opacity-50"
-                                title="Automatically check against the Registrar database and mark Verified"
-                              >
-                                {verifyingId === u.user_id ? "Checking Registrar..." : "Verify"}
-                              </button>
-                            )}
-                            <button
-                              onClick={() => handleToggleStatus(u)}
-                              disabled={isMe}
-                              className={`rounded-md px-2.5 py-1 text-[10px] font-bold transition disabled:cursor-not-allowed disabled:opacity-50 ${
-                                u.status === "Active"
-                                  ? "border border-red-200 text-red-600 hover:bg-red-50"
-                                  : "border border-[#7B1113]/25 text-[#7B1113] hover:bg-[#7B1113]/5"
-                              }`}
-                            >
-                              {u.status === "Active" ? "Deactivate" : "Activate"}
-                            </button>
-                            <button
-                              onClick={() => handleDelete(u)}
-                              disabled={isMe || deletingUserId === u.user_id}
-                              className="rounded-md border border-red-200 px-2.5 py-1 text-[10px] font-bold text-red-600 transition hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50"
-                              title="Permanently delete this account, linked records, and login"
-                            >
-                              {deletingUserId === u.user_id ? "Deleting..." : "Delete"}
-                            </button>
-                          </div>
+                          <RowActions
+                            actions={[
+                              {
+                                label: "Edit",
+                                primary: true,
+                                title: "Update this account's details",
+                                disabled: isMe,
+                                onClick: () => openEdit(u, s),
+                              },
+                              ...(u.role === "Student" && s && s.registration_status !== "Verified"
+                                ? [
+                                    {
+                                      label: verifyingId === u.user_id ? "Approving..." : "Approve",
+                                      busy: verifyingId === u.user_id,
+                                      title:
+                                        "Approve this account and generate its simulated Registrar record (student details, subjects, grades and GPA)",
+                                      disabled: isMe || verifyingId === u.user_id,
+                                      onClick: () => handleApprove(u, s),
+                                    },
+                                  ]
+                                : []),
+                              {
+                                label: u.status === "Active" ? "Deactivate" : "Activate",
+                                danger: u.status === "Active",
+                                disabled: isMe,
+                                onClick: () => handleToggleStatus(u),
+                              },
+                              {
+                                label: deletingUserId === u.user_id ? "Deleting..." : "Delete",
+                                busy: deletingUserId === u.user_id,
+                                danger: true,
+                                title: "Permanently delete this account, linked records, and login",
+                                disabled: isMe || deletingUserId === u.user_id,
+                                onClick: () => handleDelete(u),
+                              },
+                            ]}
+                          />
                         </td>
                       </tr>
                     );

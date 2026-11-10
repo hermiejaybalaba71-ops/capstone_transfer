@@ -47,17 +47,15 @@ export function downloadCsv(filename: string, rows: Record<string, unknown>[]) {
 
 export function validateFile(file: File | null): string | null {
   if (!file) return "Please choose a file.";
-  const okTypes = [
-    "image/jpeg",
-    "image/png",
-    "image/webp",
-    "image/gif",
-    "image/bmp",
-    "image/avif",
-    "image/svg+xml",
-    "application/pdf",
-  ];
-  if (!okTypes.includes(file.type)) return "Only image files (JPG, PNG, WEBP, GIF, BMP, AVIF, SVG) or PDF are allowed.";
+  // Accept ANY image — the applicant does not have to supply a readable ITR.
+  // Verification / OCR happens on the Admin ranking + ML side.
+  const name = (file.name || "").toLowerCase();
+  const imageByName = /\.(jpe?g|png|webp|gif|bmp|avif|svg|heic|heif|jfif|tif|tiff|ico|pdf)$/.test(name);
+  const isImage = file.type.startsWith("image/") || (file.type === "" && imageByName);
+  const isPdf = file.type === "application/pdf" || (file.type === "" && name.endsWith(".pdf"));
+  if (!isImage && !isPdf && !imageByName) {
+    return "Please attach an image file (JPG, PNG, WEBP, HEIC, screenshot, etc.) or a PDF.";
+  }
   if (file.size > 10 * 1024 * 1024) return "File must be 10 MB or smaller.";
   return null;
 }

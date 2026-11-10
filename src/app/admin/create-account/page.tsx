@@ -16,61 +16,42 @@ export default function CreateFacultyAccountPage() {
     setIsError(false);
     setCreating(true);
 
-    const sb = getSupabase();
+    try {
+      const sb = getSupabase();
+      const { data: { session } } = await sb.auth.getSession();
+      if (!session) throw new Error("Session expired. Please log in again.");
 
-    const { data: signUp, error: signUpError } = await sb.auth.signUp({
-      email: form.email.trim(),
-      password: form.password,
-      options: { data: { role: "Faculty" } },
-    });
+      const response = await fetch("/api/admin/create-faculty", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({
+          username: form.username,
+          email: form.email,
+          password: form.password,
+        }),
+      });
+      const result = (await response.json().catch(() => null)) as {
+        ok?: boolean;
+        message?: string;
+        error?: string;
+      } | null;
+      if (!response.ok || !result?.ok) {
+        throw new Error(result?.error || "Could not create the faculty account.");
+      }
 
-    if (signUpError) {
-      setMessage(signUpError.message);
+      setForm({ username: "", email: "", password: "" });
+      setIsError(false);
+      setMessage(result.message || "Faculty account created successfully.");
+      toast.success(result.message || "Faculty account created successfully.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not create the faculty account.");
       setIsError(true);
+    } finally {
       setCreating(false);
-      return;
     }
-
-    const authUserId = signUp.user?.id;
-    if (!authUserId) {
-      setMessage("Account created but we could not link the staff record. Please contact support.");
-      setIsError(true);
-      setCreating(false);
-      return;
-    }
-
-    // The handle_new_student_registration DB trigger fires on every auth user creation
-    // and hardcodes role='Student', producing a duplicate/wrong users row for staff.
-    // Delete any trigger-created row before upserting the correct Faculty record.
-    await sb
-      .from("users")
-      .delete()
-      .eq("auth_user_id", authUserId)
-      .eq("role", "Student");
-
-    const { error: insertError } = await sb.from("users").upsert(
-      {
-        username: form.username.trim(),
-        email: form.email.trim(),
-        role: "Faculty",
-        auth_user_id: authUserId,
-        status: "Active",
-      },
-      { onConflict: "auth_user_id" }
-    );
-
-    setCreating(false);
-
-    if (insertError) {
-      setMessage(insertError.message);
-      setIsError(true);
-      return;
-    }
-
-    setForm({ username: "", email: "", password: "" });
-    setIsError(false);
-    setMessage("Faculty account created successfully.");
-    toast.success("Faculty account created successfully.");
   }
 
   return (

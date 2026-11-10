@@ -9,6 +9,7 @@ import { STATUS_STYLES, PROGRAM_REQUIREMENT_OPTIONS, getProgramRequirementDocs }
 import { Badge } from "@/components/ui/badge";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Spinner } from "@/components/ui/spinner";
+import { RowActions } from "@/components/ui/row-actions";
 
 interface ScholarshipProgram {
   scholarship_id: number;
@@ -420,12 +421,12 @@ export default function ManageProgramsPage() {
                 <tr>
                   <th className={`${cellCls} w-12 text-center font-bold`}>#</th>
                   <th className={`${cellCls} font-bold`}>Program</th>
-                  <th className={`${cellCls} font-bold`}>Requirements</th>
+                  <th className={`${cellCls} w-32 font-bold`}>Requirements</th>
                   <th className={`${cellCls} w-28 font-bold`}>Deadline</th>
                   <th className={`${cellCls} w-20 font-bold`}>Status</th>
                   <th className={`${cellCls} w-24 font-bold`}>Applicants</th>
                   <th className={`${cellCls} w-36 font-bold`}>Created</th>
-                  <th className={`${cellCls} w-72 font-bold`}>Actions</th>
+                  <th className={`${cellCls} w-28 font-bold`}>Actions</th>
                 </tr>
               </thead>
               <tbody>
@@ -443,13 +444,19 @@ export default function ManageProgramsPage() {
                       </td>
                       <td className={cellCls}>
                         {reqs.length > 0 ? (
-                          <div className="flex flex-wrap gap-1">
-                            {reqs.map((r) => (
-                              <span key={r} className="rounded-full bg-[#7B1113]/5 px-2 py-0.5 text-[10px] font-semibold text-[#7B1113]">
-                                {r}
-                              </span>
-                            ))}
-                          </div>
+                          <RowActions
+                            label={`View (${reqs.length}/${PROGRAM_REQUIREMENT_OPTIONS.length})`}
+                            menuAlign="left"
+                            content={
+                              <div className="flex flex-wrap gap-1">
+                                {reqs.map((r) => (
+                                  <span key={r} className="rounded-full bg-[#7B1113]/5 px-2 py-0.5 text-[10px] font-semibold text-[#7B1113]">
+                                    {r}
+                                  </span>
+                                ))}
+                              </div>
+                            }
+                          />
                         ) : (
                           <span className="text-[10px] font-normal text-[#8B7376]">
                             None listed &mdash; COR, Valid ID and Signature Form apply.
@@ -466,36 +473,32 @@ export default function ManageProgramsPage() {
                       <td className={`${cellCls} whitespace-nowrap text-center font-bold text-[#7B1113]`}>{applicantCount}</td>
                       <td className={`${cellCls} whitespace-nowrap text-[#6B5458]`}>{formatDateTime(p.created_at)}</td>
                       <td className={cellCls}>
-                        <div className="flex flex-wrap items-center gap-1.5">
-                          <button
-                            onClick={() => exportProgramCsv(p.scholarship_id)}
-                            title={`Download ${applicantCount} application form(s) as CSV`}
-                            className="rounded-md border border-[#7B1113]/25 px-2.5 py-1 text-[10px] font-bold text-[#7B1113] transition hover:bg-[#7B1113]/5"
-                          >
-                            &#11015; Applications CSV
-                          </button>
-                          <button
-                            onClick={() => openPreview(p)}
-                            title="Preview and edit the student application form for this program"
-                            className="rounded-md border border-[#7B1113]/25 px-2.5 py-1 text-[10px] font-bold text-[#7B1113] transition hover:bg-[#7B1113]/5"
-                          >
-                            &#128196; View Form
-                          </button>
-                          <button
-                            onClick={() => openEdit(p)}
-                            title={`Edit ${p.scholarship_name}`}
-                            className="rounded-md bg-[#7B1113] px-2.5 py-1 text-[10px] font-bold text-white transition hover:bg-[#540111]"
-                          >
-                            &#9998; Edit
-                          </button>
-                          <button
-                            onClick={() => handleDelete(p.scholarship_id)}
-                            title={`Delete ${p.scholarship_name}`}
-                            className="rounded-md border border-red-200 px-2.5 py-1 text-[10px] font-bold text-red-600 transition hover:bg-red-50 disabled:opacity-50"
-                          >
-                            &#128465; Delete
-                          </button>
-                        </div>
+                        <RowActions
+                          actions={[
+                            {
+                              label: "Edit",
+                              primary: true,
+                              title: `Edit ${p.scholarship_name}`,
+                              onClick: () => openEdit(p),
+                            },
+                            {
+                              label: "Applications CSV",
+                              title: `Download ${applicantCount} application form(s) as CSV`,
+                              onClick: () => exportProgramCsv(p.scholarship_id),
+                            },
+                            {
+                              label: "View Form",
+                              title: "Preview and edit the student application form for this program",
+                              onClick: () => openPreview(p),
+                            },
+                            {
+                              label: "Delete",
+                              danger: true,
+                              title: `Delete ${p.scholarship_name}`,
+                              onClick: () => handleDelete(p.scholarship_id),
+                            },
+                          ]}
+                        />
                       </td>
                     </tr>
                   );

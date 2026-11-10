@@ -5,6 +5,7 @@ import { useSearchParams } from "next/navigation";
 import { useRouter } from "next/navigation";
 import toast from "react-hot-toast";
 import { getSupabase } from "@/lib/supabase/browser";
+import { isItrResubmissionCancellation } from "@/lib/constants";
 import { formatDate, validateFile } from "@/lib/utils";
 import { DISABILITY_OPTIONS, IP_GROUP_OPTIONS } from "@/lib/constants";
 import { Spinner } from "@/components/ui/spinner";
@@ -49,11 +50,10 @@ function ApplyPageContent() {
   const [fatalError, setFatalError] = useState("");
   const [profile, setProfile] = useState<StudentProfile | null>(null);
   const [programs, setPrograms] = useState<ScholarshipProgram[]>([]);
-  const [selectedProgramId, setSelectedProgramId] = useState<number | null>(
-    programIdParam ? Number(programIdParam) : null
+  const [selectedProgramIds, setSelectedProgramIds] = useState<number[]>(
+    programIdParam && Number.isFinite(Number(programIdParam)) ? [Number(programIdParam)] : []
   );
-  const [alreadyApplied, setAlreadyApplied] = useState(false);
-  const [alreadyAppliedStatus, setAlreadyAppliedStatus] = useState("");
+  const [appliedProgramStatuses, setAppliedProgramStatuses] = useState<Record<number, string>>({});
 
   const [form, setForm] = useState({
     fatherName: "",
@@ -65,59 +65,28 @@ function ApplyPageContent() {
     contactNumber: "",
     email: "",
     annualIncome: "",
+    familySize: "",
   });
   const [itrFile, setItrFile] = useState<File | null>(null);
-  const [itrIncome, setItrIncome] = useState<number | null>(null);
-  const [ocrBusy, setOcrBusy] = useState(false);
-  const [ocrStatus, setOcrStatus] = useState("");
+  // Students may upload either ITR page or both; OCR scans the available pages.
+  const [itrFile2, setItrFile2] = useState<File | null>(null);
   const [showSampleForm, setShowSampleForm] = useState(false);
 
   const [submitting, setSubmitting] = useState(false);
   const [message, setMessage] = useState("");
   const [messageType, setMessageType] = useState<"success" | "error">("error");
 
-  async function handleItrChange(file: File | null) {
+  /**
+   * The student may attach ANY image (or PDF) as proof of income — it does not
+   * have to be a readable ITR. OCR / income matching happens on the Admin
+   * ranking + machine-learning side, never on the applicant side.
+   */
+  function handleItrChange(file: File | null) {
     setItrFile(file);
-    setItrIncome(null);
-    setOcrStatus("");
-    if (!file) return;
-    if (/\.(jpg|jpeg|png|webp)$/i.test(file.name)) {
-      setOcrBusy(true);
-      setOcrStatus("Reading ITR with OCR…");
-      try {
-        const { createWorker } = await import("tesseract.js");
-        const worker = await createWorker("eng");
-        const { data } = await worker.recognize(file);
-        await worker.terminate();
-        const text = data.text || "";
-        const incomeMatch =
-          text.match(/(?:total\s+family\s+annual\s+income|total\s+annual\s+family\s+income|family\s+annual\s+income|total\s+family\s+income|total\s+gross\s+compensation\s+income|total\s+compensation\s+income|gross\s+compensation\s+income|taxable\s+compensation\s+income|annual\s+compensation\s+income|total\s+annual\s+income|total\s+gross\s+income|gross\s+income\s+from\s+(?:business|operation)|gross\s+income|total\s+taxable\s+income|net\s+taxable\s+income|total\s+income|taxable\s+income|net\s+income)[^\d]{0,40}(?:₱|PHP|P)?\s*((?:\d{1,3}(?:[,.]\d{3})+|\d{4,9})(?:[.,]\d{1,2})?)/i) ||
-          text.match(/₱\s*([\d,]+(?:\.\d{2})?)/);
-        if (incomeMatch) {
-          const amount = incomeMatch[1];
-          const decimal = amount.match(/[.,]\d{1,2}$/)?.[0] ?? "";
-          const integer = decimal ? amount.slice(0, -decimal.length) : amount;
-          const grouped = /^\d{1,3}(?:[,.]\d{3})+$/.test(integer);
-          const normalized = grouped
-            ? `${integer.replace(/[,.]/g, "")}${decimal ? `.${decimal.slice(1)}` : ""}`
-            : amount.replace(/,/g, "");
-          const parsed = Number(normalized);
-          if (!isNaN(parsed) && parsed > 0) {
-            setItrIncome(Math.round(parsed));
-            setOcrStatus(`OCR read ₱${Math.round(parsed).toLocaleString()} from the ITR. Enter your declared annual family income to see the match percentage.`);
-          } else {
-            setOcrStatus("OCR read the ITR but could not detect income. Please enter it manually.");
-          }
-        } else {
-          setOcrStatus("OCR could not find an income figure on this ITR. Please enter annual family income manually.");
-        }
-      } catch {
-        setOcrStatus("OCR failed for this file. Please enter annual family income manually.");
-      }
-      setOcrBusy(false);
-    } else if (/\.pdf$/i.test(file.name)) {
-      setOcrStatus("PDF selected. Enter the annual family income shown on the ITR; automatic image matching supports JPG, PNG, and WEBP.");
-    }
+  }
+
+  function handleItrPage2Change(file: File | null) {
+    setItrFile2(file);
   }
 
   useEffect(() => {
@@ -218,21 +187,31 @@ function ApplyPageContent() {
   }, [router]);
 
   useEffect(() => {
-    if (!profile || !selectedProgramId) return;
+    if (!profile) return;
     let cancelled = false;
     const sb = getSupabase();
     sb.from("scholarship_applications")
-      .select("application_status")
+      .select("scholarship_id, application_status, remarks")
       .eq("student_id", profile.studentId)
-      .eq("scholarship_id", selectedProgramId)
-      .maybeSingle()
       .then(({ data }) => {
         if (cancelled) return;
-        setAlreadyApplied(!!data);
-        setAlreadyAppliedStatus(data?.application_status ?? "");
+        const statuses: Record<number, string> = {};
+        (data || []).forEach((application) => {
+          if (!isItrResubmissionCancellation(application)) {
+            const scholarshipId = Number(application.scholarship_id);
+            if (Number.isFinite(scholarshipId)) {
+              const status = application.application_status;
+              const currentStatus = statuses[scholarshipId];
+              if (status !== "Not Approved" || !currentStatus) {
+                statuses[scholarshipId] = status;
+              }
+            }
+          }
+        });
+        setAppliedProgramStatuses(statuses);
       });
     return () => { cancelled = true; };
-  }, [profile, selectedProgramId]);
+  }, [profile]);
 
   function handleFormChange(field: string, value: string) {
     setForm((f) => ({ ...f, [field]: value }));
@@ -257,20 +236,6 @@ function ApplyPageContent() {
 
   const PH_PHONE_RE = /^09\d{9}$/;
   const PH_ZIP_RE = /^\d{4}$/;
-  const declaredFamilyIncome = Number(form.annualIncome);
-  const itrMatchPct =
-    itrIncome !== null &&
-    form.annualIncome.trim() !== "" &&
-    Number.isFinite(declaredFamilyIncome) &&
-    declaredFamilyIncome >= 0
-      ? Math.max(
-          0,
-          Math.min(
-            100,
-            100 * (1 - Math.abs(itrIncome - declaredFamilyIncome) / Math.max(itrIncome, declaredFamilyIncome, 1)),
-          ),
-        )
-      : null;
   const NAME_RE = /^[A-Za-z\u00C0-\u00FF'.\- ]+$/;
 
   function validateNameField(label: string, value: string): string | null {
@@ -305,20 +270,27 @@ function ApplyPageContent() {
     e.preventDefault();
     if (!profile) return;
 
-    if (!selectedProgramId) {
-      setMessage("Please select a scholarship program.");
+    if (!selectedProgramIds.length) {
+      setMessage("Select at least one scholarship program.");
       setMessageType("error");
       return;
     }
 
-    const chosenProgram = programs.find((p) => p.scholarship_id === selectedProgramId);
-    if (chosenProgram?.status !== "Open") {
-      setMessage(`"${chosenProgram?.scholarship_name || "This program"}" is no longer open for applications.`);
-      setMessageType("error");
-      return;
-    }
-    if (isDeadlinePassed(chosenProgram)) {
-      setMessage(`Application cut-off reached — "${chosenProgram.scholarship_name}" closed last ${formatDate(chosenProgram.deadline)}. Applications are no longer accepted.`);
+    const chosenPrograms = selectedProgramIds.map((id) =>
+      programs.find((program) => program.scholarship_id === id)
+    );
+    const selectedPrograms = chosenPrograms.filter(
+      (program): program is ScholarshipProgram => Boolean(program)
+    );
+    const unavailableProgram = chosenPrograms.find(
+      (program) => program && (program.status !== "Open" || isDeadlinePassed(program))
+    );
+    if (chosenPrograms.some((program) => !program) || unavailableProgram) {
+      setMessage(
+        unavailableProgram
+          ? `"${unavailableProgram.scholarship_name}" is no longer accepting applications. Remove it and try again.`
+          : "A selected scholarship is no longer available. Refresh and try again."
+      );
       setMessageType("error");
       return;
     }
@@ -338,13 +310,29 @@ function ApplyPageContent() {
     const zipErr = validateZipcode(form.zipcode);
     if (zipErr) { setMessage(zipErr); setMessageType("error"); return; }
 
-    if (!itrFile) {
-      setMessage("Please attach the Income Tax Return (ITR) file.");
+    // Household size drives the per-capita income the model learns from
+    // (the historical label is a per-capita income decile), so it is required.
+    const familySize = Number(form.familySize);
+    if (!Number.isInteger(familySize) || familySize < 1 || familySize > 20) {
+      setMessage("Family Size must be a whole number from 1 to 20 (number of people in the household).");
+      setMessageType("error");
+      return;
+    }
+    if (!(Number(form.annualIncome) >= 0)) {
+      setMessage("Annual Family Income must be zero or more.");
       setMessageType("error");
       return;
     }
 
-    const fileErr = validateFile(itrFile);
+    if (!itrFile && !itrFile2) {
+      setMessage("Please attach at least one ITR page.");
+      setMessageType("error");
+      return;
+    }
+
+    const fileErr =
+      (itrFile ? validateFile(itrFile) : "") ||
+      (itrFile2 ? validateFile(itrFile2) : "");
     if (fileErr) {
       setMessage(fileErr);
       setMessageType("error");
@@ -358,13 +346,31 @@ function ApplyPageContent() {
       const sb = getSupabase();
       const existingApp = await sb
         .from("scholarship_applications")
-        .select("application_id, application_status")
+        .select("application_id, scholarship_id, application_status, remarks")
         .eq("student_id", profile.studentId)
-        .eq("scholarship_id", selectedProgramId)
-        .maybeSingle();
+        .in("scholarship_id", selectedProgramIds);
 
-      if (existingApp.data) {
-        setMessage("You have already applied to this scholarship program.");
+      if (existingApp.error) {
+        setMessage(`Could not check existing applications: ${existingApp.error.message}`);
+        setMessageType("error");
+        setSubmitting(false);
+        return;
+      }
+
+      const blockingApplications = (existingApp.data || []).filter(
+        (application) =>
+          !isItrResubmissionCancellation(application) &&
+          application.application_status !== "Not Approved"
+      );
+      if (blockingApplications.length) {
+        const blockedNames = blockingApplications
+          .map((application) => programs.find((p) => p.scholarship_id === application.scholarship_id)?.scholarship_name)
+          .filter(Boolean);
+        setMessage(
+          blockedNames.length
+            ? `You already applied to: ${blockedNames.join(", ")}. Remove those programs and submit the others.`
+            : "You already applied to one or more selected programs. Remove them and submit the others."
+        );
         setMessageType("error");
         setSubmitting(false);
         return;
@@ -377,6 +383,13 @@ function ApplyPageContent() {
         .eq("application_status", "Approved")
         .limit(1);
 
+      if (hasApproved.error) {
+        setMessage(`Could not check approved applications: ${hasApproved.error.message}`);
+        setMessageType("error");
+        setSubmitting(false);
+        return;
+      }
+
       if ((hasApproved.data || []).length > 0) {
         setMessage("You already have an approved scholarship. Applications are closed for you.");
         setMessageType("error");
@@ -384,60 +397,138 @@ function ApplyPageContent() {
         return;
       }
 
-      const safeItrName = itrFile.name.replace(/[^a-zA-Z0-9._-]/g, "_");
-      const itrPath = `${profile.studentId}/ITR/${Date.now()}_${safeItrName}`;
-
-      const itrUpload = await sb.storage.from("itr-documents").upload(itrPath, itrFile);
-      if (itrUpload.error) {
-        setMessage(`ITR upload failed: ${itrUpload.error.message}`);
+      // The "itr-documents" bucket has no usable RLS insert policy, so we ask
+      // our own API route for a one-time signed upload URL (signed with the
+      // service-role key) and send the file straight to Supabase Storage.
+      // Each submitted ITR page gets its own signed URL + object. Page 2 is optional.
+      const { data: sessionData } = await sb.auth.getSession();
+      const accessToken = sessionData.session?.access_token;
+      if (!accessToken) {
+        setMessage("Session expired. Please log in again.");
         setMessageType("error");
         setSubmitting(false);
         return;
       }
 
-      const { data: appRow, error: appErr } = await sb
+      async function uploadItrPage(file: File, label: string): Promise<string> {
+        const signRes = await fetch("/api/student/upload-itr", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${accessToken}`,
+          },
+          body: JSON.stringify({
+            file_name: file.name,
+            content_type: file.type,
+            size: file.size,
+          }),
+        });
+        const signed = (await signRes.json().catch(() => null)) as {
+          ok?: boolean;
+          path?: string;
+          token?: string;
+          error?: string;
+        } | null;
+
+        if (!signRes.ok || !signed?.ok || !signed.path || !signed.token) {
+          throw new Error(
+            `ITR ${label} upload failed: ${signed?.error || "Could not prepare the upload."}`
+          );
+        }
+
+        const up = await sb.storage.from("itr-documents").uploadToSignedUrl(signed.path, signed.token, file, {
+          contentType: file.type || "application/octet-stream",
+        });
+        if (up.error) {
+          throw new Error(`ITR ${label} upload failed: ${up.error.message}`);
+        }
+        return signed.path;
+      }
+
+      let itrPath = "";
+      let itrPath2 = "";
+      try {
+        if (itrFile) {
+          itrPath = await uploadItrPage(itrFile, "Page 1");
+        }
+        if (itrFile2) {
+          itrPath2 = await uploadItrPage(itrFile2, "Page 2");
+        }
+      } catch (upErr) {
+        for (const uploadedPath of [itrPath, itrPath2]) {
+          if (!uploadedPath) continue;
+          await fetch("/api/student/upload-itr", {
+            method: "DELETE",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${accessToken}`,
+            },
+            body: JSON.stringify({ path: uploadedPath }),
+          }).catch(() => null);
+        }
+        setMessage(upErr instanceof Error ? upErr.message : "ITR upload failed.");
+        setMessageType("error");
+        setSubmitting(false);
+        return;
+      }
+
+      const { data: appRows, error: appErr } = await sb
         .from("scholarship_applications")
-        .insert({
+        .insert(selectedPrograms.map((program) => ({
           student_id: profile.studentId,
-          scholarship_id: selectedProgramId,
+          scholarship_id: program.scholarship_id,
           application_data: {
             annual_income_family: Number(form.annualIncome) || 0,
-            itr_file: itrPath,
+            family_size: familySize,
+            itr_file: itrPath || null,
+            itr_file_p2: itrPath2 || null,
           },
-        })
-        .select()
-        .single();
+        })))
+        .select("application_id, scholarship_id");
 
       if (appErr) {
-        await sb.storage.from("itr-documents").remove([itrPath]);
+        // Best-effort cleanup — only this student's own folder can be deleted.
+        for (const uploadedPath of [itrPath, itrPath2]) {
+          if (!uploadedPath) continue;
+          await fetch("/api/student/upload-itr", {
+            method: "DELETE",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${accessToken}`,
+            },
+            body: JSON.stringify({ path: uploadedPath }),
+          }).catch(() => null);
+        }
         setMessage(`Application failed: ${appErr.message}`);
         setMessageType("error");
         setSubmitting(false);
         return;
       }
 
-      const { error: chedErr } = await sb.from("ched_form_input").insert({
-        application_id: appRow.application_id,
-        student_id: String(profile.studentNumber || profile.studentId),
-        last_name: profile.lastName,
-        given_name: profile.givenName,
-        ext_name: profile.extName || null,
-        middle_name: profile.middleName || null,
-        sex: profile.sex,
-        birthdate: profile.birthdate,
-        complete_program_name: profile.programName,
-        year_level: profile.yearLevel,
-        father_name: form.fatherName.trim(),
-        mother_name: form.motherName.trim(),
-        street_barangay: form.streetBarangay.trim(),
-        zipcode: form.zipcode.replace(/\D/g, ""),
-        disability: form.disability.trim() || null,
-        indigenous_people_group: form.ipGroup.trim() || null,
-        contact_number: form.contactNumber.replace(/\D/g, ""),
-        email_address: form.email.trim(),
-        income_tax_return: itrPath,
-        annual_income_family: Number(form.annualIncome) || 0,
-      });
+      const { error: chedErr } = await sb.from("ched_form_input").insert(
+        (appRows || []).map((appRow) => ({
+          application_id: appRow.application_id,
+          student_id: String(profile.studentNumber || profile.studentId),
+          last_name: profile.lastName,
+          given_name: profile.givenName,
+          ext_name: profile.extName || null,
+          middle_name: profile.middleName || null,
+          sex: profile.sex,
+          birthdate: profile.birthdate,
+          complete_program_name: profile.programName,
+          year_level: profile.yearLevel,
+          father_name: form.fatherName.trim(),
+          mother_name: form.motherName.trim(),
+          street_barangay: form.streetBarangay.trim(),
+          zipcode: form.zipcode.replace(/\D/g, ""),
+          disability: form.disability.trim() || null,
+          indigenous_people_group: form.ipGroup.trim() || null,
+          contact_number: form.contactNumber.replace(/\D/g, ""),
+          email_address: form.email.trim(),
+          income_tax_return: itrPath || null,
+          annual_income_family: Number(form.annualIncome) || 0,
+        }))
+      );
 
       if (chedErr) {
         setMessage(`Application saved but CHED form data failed: ${chedErr.message}`);
@@ -446,21 +537,26 @@ function ApplyPageContent() {
         return;
       }
 
-      const selectedProgram = programs.find((p) => p.scholarship_id === selectedProgramId);
-
-      await sb.from("notifications_announcements").insert({
+      const { error: notificationError } = await sb.from("notifications_announcements").insert(selectedPrograms.map((selectedProgram) => ({
         student_id: profile.studentId,
         title: "Scholarship Application Submitted",
         message: `Your application for "${selectedProgram?.scholarship_name || "scholarship"}" has been submitted and is currently under review. You will be notified once a decision has been made.`,
         notification_type: "Status Update",
         status: "Unread",
-      });
+      })));
+      if (notificationError) {
+        console.error("Could not create application notifications:", notificationError.message);
+      }
 
       setMessage(
-        `Application submitted for "${selectedProgram?.scholarship_name || "scholarship"}". Upload your supporting documents and academic records under Profile & Documents, and track the status in Application Status.`
+        `${appRows?.length || selectedPrograms.length} scholarship application(s) submitted. Upload your supporting documents and academic records under Profile & Documents, and track each application in Application Status.`
       );
       setMessageType("success");
-      toast.success(`Application submitted for "${selectedProgram?.scholarship_name || "scholarship"}"!`);
+      toast.success(`${appRows?.length || selectedPrograms.length} scholarship application(s) submitted!`);
+      setAppliedProgramStatuses((current) => ({
+        ...current,
+        ...Object.fromEntries(selectedPrograms.map((program) => [program.scholarship_id, "Pending"])),
+      }));
 
       setForm({
         fatherName: "",
@@ -472,8 +568,11 @@ function ApplyPageContent() {
         contactNumber: "",
         email: profile.email,
         annualIncome: "",
+        familySize: "",
       });
+      setSelectedProgramIds([]);
       setItrFile(null);
+      setItrFile2(null);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "An unexpected error occurred.";
       setMessage(msg);
@@ -503,7 +602,7 @@ function ApplyPageContent() {
       <div className="flex items-start justify-between gap-3">
         <div>
           <h1 className="text-xl font-bold text-[#241012]">Submit Application</h1>
-          <p className="mt-1 text-xs text-[#6B5458]">Fill in the form to apply for a scholarship. Upload your supporting documents and academic records under Profile &amp; Documents.</p>
+          <p className="mt-1 text-xs text-[#6B5458]">Select one or more available scholarships and submit one application per selected program. Upload supporting documents and academic records under Profile &amp; Documents.</p>
         </div>
         <button
           type="button"
@@ -526,59 +625,103 @@ function ApplyPageContent() {
         </div>
       )}
 
-      {alreadyApplied && (
-        <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-          You already applied to this program
-          {alreadyAppliedStatus ? ` (${alreadyAppliedStatus})` : ""}. Submission is
-          disabled — track it under <span className="font-semibold">Status</span>.
-        </div>
-      )}
-
       <form onSubmit={handleSubmit} className="mt-4 space-y-5">
         <div className="rounded-xl border border-[#241012]/[0.06] bg-white p-5 shadow-sm">
-          <h2 className="text-sm font-bold text-[#241012]">Scholarship Program</h2>
-          <select
-            value={selectedProgramId || ""}
-            onChange={(e) => setSelectedProgramId(Number(e.target.value) || null)}
-            required
-            className="mt-3 w-full rounded-lg border border-[#241012]/15 bg-white px-3 py-2 text-xs outline-none focus:border-[#7B1113]"
-          >
-            <option value="">Choose a program...</option>
-            {programs.map((p) => {
-              const closed = p.status !== "Open" || isDeadlinePassed(p);
-              return (
-                <option key={p.scholarship_id} value={p.scholarship_id} disabled={closed}>
-                  {p.scholarship_name}
-                  {p.status !== "Open"
-                    ? " — Closed"
-                    : isDeadlinePassed(p)
-                      ? ` — CLOSED: deadline was ${formatDate(p.deadline)}`
-                      : p.deadline
-                        ? ` — Deadline: ${formatDate(p.deadline)}`
-                        : ""}
-                </option>
-              );
-            })}
-          </select>
-          {(() => {
-            const chosen = programs.find((p) => p.scholarship_id === selectedProgramId);
-            if (chosen && isDeadlinePassed(chosen)) {
-              return (
-                <div className="mt-3 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-xs font-medium text-red-700">
-                  The application deadline for <b>{chosen.scholarship_name}</b> was {formatDate(chosen.deadline)}
-                  {" "}— the cut-off has passed, so students can no longer apply. Choose another open program.
-                </div>
-              );
-            }
-            if (chosen?.deadline) {
-              return (
-                <div className="mt-3 rounded-lg border border-[#241012]/[0.06] bg-[#FAF7F5] px-4 py-3 text-xs text-[#6B5458]">
-                  Applications close on <b className="text-[#7B1113]">{formatDate(chosen.deadline)}</b> (11:59 PM) — after that date this program is automatically closed to new applications.
-                </div>
-              );
-            }
-            return null;
-          })()}
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h2 className="text-sm font-bold text-[#241012]">Scholarship Programs</h2>
+              <p className="mt-1 text-[11px] text-[#6B5458]">
+                Choose one or more programs. Each selected program gets its own application.
+              </p>
+            </div>
+          </div>
+          <details className="group relative mt-3">
+            <summary className="flex cursor-pointer list-none items-center justify-between gap-3 rounded-lg border border-[#241012]/15 bg-white px-3 py-2.5 text-xs text-[#241012] outline-none focus:border-[#7B1113] [&::-webkit-details-marker]:hidden">
+              <span className="truncate">
+                {selectedProgramIds.length
+                  ? `${selectedProgramIds.length} scholarship program${selectedProgramIds.length === 1 ? "" : "s"} selected`
+                  : "Choose available scholarship programs..."}
+              </span>
+              <span aria-hidden="true" className="shrink-0 text-[#6B5458] transition group-open:rotate-180">▼</span>
+            </summary>
+            <div className="absolute left-0 right-0 top-full z-30 mt-1 rounded-lg border border-[#241012]/15 bg-white p-3 shadow-xl">
+              <div className="mb-2 flex justify-end gap-2 border-b border-[#241012]/10 pb-2">
+                <button
+                  type="button"
+                  onClick={() => setSelectedProgramIds(
+                    programs
+                      .filter((program) =>
+                        program.status === "Open" &&
+                        !isDeadlinePassed(program) &&
+                        (!appliedProgramStatuses[program.scholarship_id] ||
+                          appliedProgramStatuses[program.scholarship_id] === "Not Approved")
+                      )
+                      .map((program) => program.scholarship_id)
+                  )}
+                  className="rounded-md border border-[#7B1113]/30 px-2.5 py-1 text-[10px] font-bold text-[#7B1113] hover:bg-[#7B1113]/5"
+                >
+                  Select all available
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSelectedProgramIds([])}
+                  className="rounded-md border border-[#241012]/15 px-2.5 py-1 text-[10px] font-bold text-[#6B5458] hover:bg-[#FAF7F5]"
+                >
+                  Clear
+                </button>
+              </div>
+              <div className="max-h-56 space-y-1 overflow-y-auto">
+                {programs.map((program) => {
+                  const closed = program.status !== "Open" || isDeadlinePassed(program);
+                  const appliedStatus = appliedProgramStatuses[program.scholarship_id];
+                  const canReapply = appliedStatus === "Not Approved";
+                  const blockedByExistingApplication = Boolean(appliedStatus) && !canReapply;
+                  const checked = selectedProgramIds.includes(program.scholarship_id);
+                  return (
+                    <label
+                      key={program.scholarship_id}
+                      className={`flex cursor-pointer items-start gap-2 rounded-md px-2 py-2 hover:bg-[#FAF7F5] ${
+                        closed || blockedByExistingApplication ? "opacity-60" : ""
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        disabled={closed || blockedByExistingApplication}
+                        onChange={(event) => {
+                          setSelectedProgramIds((current) =>
+                            event.target.checked
+                              ? [...new Set([...current, program.scholarship_id])]
+                              : current.filter((id) => id !== program.scholarship_id)
+                          );
+                        }}
+                        className="mt-0.5 accent-[#7B1113]"
+                      />
+                      <span className="min-w-0 flex-1">
+                        <span className="block text-xs font-semibold text-[#241012]">{program.scholarship_name}</span>
+                        <span className="mt-0.5 block text-[10px] text-[#6B5458]">
+                          {canReapply
+                            ? "Not approved — you may apply again"
+                            : appliedStatus
+                            ? `Already applied (${appliedStatus})`
+                            : closed
+                              ? isDeadlinePassed(program)
+                                ? `Closed — deadline was ${formatDate(program.deadline)}`
+                                : "Closed to applications"
+                              : program.deadline
+                                ? `Open — deadline: ${formatDate(program.deadline)}`
+                                : "Open"}
+                        </span>
+                      </span>
+                    </label>
+                  );
+                })}
+                {!programs.length && (
+                  <p className="rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-800">There are no open scholarship programs right now.</p>
+                )}
+              </div>
+            </div>
+          </details>
         </div>
 
         <div className="rounded-xl border border-[#241012]/[0.06] bg-white p-5 shadow-sm">
@@ -704,36 +847,49 @@ function ApplyPageContent() {
                 required
                 className="mt-1 w-full rounded-lg border border-[#241012]/15 bg-white px-3 py-2 text-xs outline-none focus:border-[#7B1113]"
               />
-              {itrIncome !== null && (
-                <span className="mt-1 block text-[11px] font-medium text-[#6B5458]">
-                  OCR read from ITR: <b className="text-[#7B1113]">₱{itrIncome.toLocaleString()}</b>
-                </span>
-              )}
-              {itrMatchPct !== null && (
-                <span
-                  aria-live="polite"
-                  className={`mt-1 inline-flex rounded-full px-2.5 py-1 text-[11px] font-bold ${
-                    itrMatchPct >= 90
-                      ? "bg-emerald-100 text-emerald-800"
-                      : "bg-amber-100 text-amber-800"
-                  }`}
-                >
-                  OCR MATCH: {itrMatchPct.toFixed(2)}% {itrMatchPct >= 90 ? "— Match" : "— Review difference"}
-                </span>
-              )}
+            </label>
+            <label className="block text-xs font-semibold text-[#241012]">
+              Family Size (household members) *
+              <input
+                type="number"
+                min="1"
+                max="20"
+                step="1"
+                value={form.familySize}
+                onChange={(e) => handleFormChange("familySize", e.target.value)}
+                placeholder="4"
+                required
+                className="mt-1 w-full rounded-lg border border-[#241012]/15 bg-white px-3 py-2 text-xs outline-none focus:border-[#7B1113]"
+              />
+              <span className="mt-1 block text-[11px] text-[#6B5458]">
+                Number of people supported by this income (used for per-capita income).
+              </span>
             </label>
             <label className="block text-xs font-semibold text-[#241012] sm:col-span-2">
-              Income Tax Return (ITR) File * — JPG / PNG / PDF, max 10 MB
+              ITR Page 1 (optional) — front page (JPG, PNG, HEIC, screenshot) or PDF, max 10 MB
               <input
                 type="file"
-                accept=".jpg,.jpeg,.png,.webp,.pdf"
+                accept="image/*,.pdf,application/pdf"
                 onChange={(e) => handleItrChange(e.target.files?.[0] || null)}
-                required
                 className="mt-1 w-full rounded-lg border border-dashed border-[#241012]/15 bg-[#FAF7F5] px-3 py-2 text-xs file:mr-3 file:rounded-md file:border-0 file:bg-[#7B1113] file:px-3 file:py-1.5 file:text-xs file:font-semibold file:text-white"
               />
-              {ocrStatus && (
-                <span className={`mt-1 block text-[11px] ${ocrBusy ? "text-amber-700" : "text-[#6B5458]"}`}>{ocrStatus}</span>
-              )}
+              <span className="mt-1 block text-[11px] text-[#6B5458]">
+                {itrFile ? `Attached: ${itrFile.name}` : "Upload Page 1, Page 2, or both pages."}
+              </span>
+            </label>
+            <label className="block text-xs font-semibold text-[#241012] sm:col-span-2">
+              ITR Page 2 (optional) — back page with the income figures (JPG, PNG, HEIC, screenshot) or PDF, max 10 MB
+              <input
+                type="file"
+                accept="image/*,.pdf,application/pdf"
+                onChange={(e) => handleItrPage2Change(e.target.files?.[0] || null)}
+                className="mt-1 w-full rounded-lg border border-dashed border-[#241012]/15 bg-[#FAF7F5] px-3 py-2 text-xs file:mr-3 file:rounded-md file:border-0 file:bg-[#7B1113] file:px-3 file:py-1.5 file:text-xs file:font-semibold file:text-white"
+              />
+              <span className="mt-1 block text-[11px] text-[#6B5458]">
+                {itrFile2
+                  ? `Attached: ${itrFile2.name}`
+                  : "Upload at least one page. Both pages may help OCR find the income; unreadable OCR falls back to declared income."}
+              </span>
             </label>
           </div>
         </div>
@@ -751,17 +907,12 @@ function ApplyPageContent() {
         <div className="flex justify-end">
           <button
             type="submit"
-            disabled={submitting || alreadyApplied || (!!selectedProgramId && (isDeadlinePassed(programs.find((p) => p.scholarship_id === selectedProgramId)) || programs.find((p) => p.scholarship_id === selectedProgramId)?.status !== "Open"))}
-            title={(selectedProgramId && (isDeadlinePassed(programs.find((p) => p.scholarship_id === selectedProgramId)) || programs.find((p) => p.scholarship_id === selectedProgramId)?.status !== "Open")) ? "Application cut-off reached for this program" : undefined}
+            disabled={submitting || selectedProgramIds.length === 0}
             className="rounded-lg bg-[#7B1113] px-4 py-2.5 text-xs font-bold text-white hover:bg-[#540111] disabled:opacity-60"
           >
             {submitting
-              ? "Submitting\u2026"
-              : alreadyApplied
-                ? "Already Applied"
-                : selectedProgramId && isDeadlinePassed(programs.find((p) => p.scholarship_id === selectedProgramId))
-                  ? "Deadline Passed"
-                  : "Submit Application"}
+              ? "Submitting applications\u2026"
+              : `Submit ${selectedProgramIds.length || ""} Application${selectedProgramIds.length === 1 ? "" : "s"}`}
           </button>
         </div>
       </form>

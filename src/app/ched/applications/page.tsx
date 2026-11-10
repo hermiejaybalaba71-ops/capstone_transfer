@@ -3,7 +3,7 @@ import toast from "react-hot-toast";
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { getSupabase } from "@/lib/supabase/browser";
+import { getSupabase, authHeaders } from "@/lib/supabase/browser";
 import { formatDateTime, downloadCsv } from "@/lib/utils";
 import { STATUS_STYLES } from "@/lib/constants";
 import { autoRejectSiblings } from "@/lib/scholarship";
@@ -31,6 +31,7 @@ interface Application {
   application_date: string;
   application_status: string;
   remarks?: string | null;
+  application_data?: { itr_file?: string | null; itr_file_p2?: string | null } | null;
   scholarship_programs?: { scholarship_name: string };
   student_accounts?: { given_name: string; last_name: string; student_number: string; program_name: string; year_level?: string; sex?: string; registration_status?: string; account_status?: string };
 }
@@ -152,6 +153,13 @@ export default function ChedApplicationsPage() {
   const appChed = (app: Application) => chedForms.filter((c) => c.application_id === app.application_id);
   const appDocs = (app: Application) => docs.filter((d) => d.student_id === app.student_id);
   const appAcads = (app: Application) => acads.filter((a) => a.student_id === app.student_id);
+  const appItrPages = (app: Application) => {
+    const legacyPage1 = appChed(app).find((c) => c.income_tax_return)?.income_tax_return;
+    return [
+      { label: "Page 1", path: app.application_data?.itr_file || legacyPage1 },
+      { label: "Page 2", path: app.application_data?.itr_file_p2 },
+    ].filter((page): page is { label: string; path: string } => Boolean(page.path));
+  };
 
   const statusApps = statusFilter
     ? applications.filter((a) => a.application_status === statusFilter)
@@ -203,10 +211,23 @@ export default function ChedApplicationsPage() {
       const res = await sb.storage.from("academic-records").createSignedUrl(a.proof_image_path, 3600);
       if (res.data?.signedUrl) urls[a.proof_image_path] = res.data.signedUrl;
     }
-    for (const c of appChed(app)) {
-      if (!c.income_tax_return) continue;
-      const res = await sb.storage.from("itr-documents").createSignedUrl(c.income_tax_return, 3600);
-      if (res.data?.signedUrl) urls[c.income_tax_return] = res.data.signedUrl;
+    for (const page of appItrPages(app)) {
+      const res = await sb.storage.from("itr-documents").createSignedUrl(page.path, 3600);
+      if (res.data?.signedUrl) urls[page.path] = res.data.signedUrl;
+    }
+    const missingItrPaths = appItrPages(app)
+      .map((page) => page.path)
+      .filter((path) => !urls[path]);
+    if (missingItrPaths.length) {
+      const response = await fetch("/api/storage/signed-url", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(await authHeaders()) },
+        body: JSON.stringify({ bucket: "itr-documents", paths: missingItrPaths }),
+      });
+      if (response.ok) {
+        const payload = (await response.json()) as { urls?: Record<string, string> };
+        Object.assign(urls, payload.urls || {});
+      }
     }
     setFileUrls(urls);
   }
@@ -768,19 +789,19 @@ export default function ChedApplicationsPage() {
                       <div><p className="text-[10px] uppercase tracking-wide text-[#8B7376]">IP Group</p><p className="mt-0.5 font-semibold text-[#7B1113]">{c.indigenous_people_group || "\u2014"}</p></div>
                       <div><p className="text-[10px] uppercase tracking-wide text-[#8B7376]">Annual Family Income</p><p className="mt-0.5 font-semibold text-[#7B1113]">&#8369;{Number(c.annual_income_family || 0).toLocaleString()}/yr</p></div>
                       <div>
-                        <p className="text-[10px] uppercase tracking-wide text-[#8B7376]">ITR File</p>
-                        {c.income_tax_return ? (
-                          fileUrls[c.income_tax_return] ? (
-                            <a href={fileUrls[c.income_tax_return]} target="_blank" rel="noreferrer" className="mt-1 inline-flex items-center gap-1.5 rounded-lg bg-[#7B1113] px-3 py-1.5 text-[11px] font-bold text-white shadow-sm transition hover:bg-[#540111]" title="Open the submitted Income Tax Return in a new tab">
-                              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="h-3.5 w-3.5"><path strokeLinecap="round" strokeLinejoin="round" d="M3 10.5h18M3 6h18M12 6v18M10.5 3h3M4.5 21h15a1.5 1.5 0 001.5-1.5V7.5A1.5 1.5 0 0019.5 6h-15A1.5 1.5 0 003 7.5v12A1.5 1.5 0 004.5 21z" /></svg>
-                              View ITR
-                            </a>
-                          ) : (
-                            <button type="button" disabled className="mt-1 inline-flex cursor-default items-center gap-1.5 rounded-lg border border-[#7B1113]/30 px-3 py-1.5 text-[11px] font-semibold text-[#8B7376]" title="Opening...">
-                              <span className="h-3 w-3 animate-spin rounded-full border-2 border-[#7B1113]/30 border-t-[#7B1113]" />
-                              Opening ITR...
-                            </button>
-                          )
+                        <p className="text-[10px] uppercase tracking-wide text-[#8B7376]">ITR Files</p>
+                        {appItrPages(viewingApp).length ? (
+                          <div className="mt-1 flex flex-col items-start gap-1">
+                            {appItrPages(viewingApp).map((page) => (
+                              fileUrls[page.path] ? (
+                                <a key={page.label} href={fileUrls[page.path]} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1.5 rounded-lg bg-[#7B1113] px-3 py-1.5 text-[11px] font-bold text-white shadow-sm transition hover:bg-[#540111]">
+                                  View ITR {page.label}
+                                </a>
+                              ) : (
+                                <span key={page.label} className="text-[10px] font-semibold text-[#8B7376]">Opening ITR {page.label}...</span>
+                              )
+                            ))}
+                          </div>
                         ) : <p className="mt-0.5 font-semibold text-[#7B1113]">{"\u2014"}</p>}
                       </div>
                     </div>

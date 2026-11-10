@@ -57,6 +57,23 @@ export function getSupabase() {
   return browserClient;
 }
 
+/**
+ * Auth headers for our own /api routes.
+ *
+ * The session lives in a cookie, but several API routes read it server-side and
+ * a cookie can go missing (large session, SameSite, proxy). Sending the access
+ * token explicitly is deterministic — the routes accept either form.
+ */
+export async function authHeaders(): Promise<Record<string, string>> {
+  try {
+    const { data } = await getSupabase().auth.getSession();
+    const token = data.session?.access_token;
+    return token ? { Authorization: `Bearer ${token}` } : {};
+  } catch {
+    return {};
+  }
+}
+
 export function useSession() {
   const [session, setSession] = useState<Session | null>(null);
   const [user, setUser] = useState<User | null>(null);

@@ -133,4 +133,14 @@ export const YEAR_LEVELS = ["1st Year", "2nd Year", "3rd Year", "4th Year", "5th
 
 export const APPLICATION_STATUSES = ["Pending", "Approved", "Not Approved"] as const;
 
+export const ITR_RESUBMISSION_CANCELLATION_MARKER = "[ITR_RESUBMISSION_CANCELLED]";
+
+export function isItrResubmissionCancellation(application: {
+  application_status?: string | null;
+  remarks?: string | null;
+}): boolean {
+  return application.application_status === "Not Approved"
+    && Boolean(application.remarks?.startsWith(ITR_RESUBMISSION_CANCELLATION_MARKER));
+}
+
 export const REQUIRED_DOCS = ["COR", "Valid ID", "Signature Form", "Academic Record"] as const;

@@ -1,6 +1,6 @@
 "use client";
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { useState } from "react";
 
 export interface SidebarItem {
@@ -33,6 +33,7 @@ interface SidebarProps {
 
 export function Sidebar({ items, title, subtitle, username, userRole, onLogout, notificationCount = 0, notificationHref, fetchNotifications, onNotificationClick }: SidebarProps) {
   const pathname = usePathname();
+  const router = useRouter();
   const [open, setOpen] = useState(false);
   const [notifOpen, setNotifOpen] = useState(false);
   const [notifLoading, setNotifLoading] = useState(false);
@@ -62,7 +63,7 @@ export function Sidebar({ items, title, subtitle, username, userRole, onLogout, 
       setNotifItems((prev) => prev.filter((i) => i.id !== n.id));
     } else if (notificationHref) {
       setOpen(false);
-      window.location.href = notificationHref;
+      router.push(notificationHref);
     }
   }
 

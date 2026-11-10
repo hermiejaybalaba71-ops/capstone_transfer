@@ -3,7 +3,7 @@ import toast from "react-hot-toast";
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { getSupabase } from "@/lib/supabase/browser";
+import { getSupabase, authHeaders } from "@/lib/supabase/browser";
 import { downloadCsv } from "@/lib/utils";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Spinner } from "@/components/ui/spinner";
@@ -18,10 +18,16 @@ interface Applicant {
   program: string | null;
   annual_income_family: number | null;
   itr_path: string | null;
+  // ITR Page 2 (BIR 1701-MS back page) - the income figures live there, so
+  // the OCR scan falls back to it when Page 1 yields no income.
+  itr_path_p2: string | null;
   year_level: string | null;
   sex: string | null;
   shs_gwa: number | null;
   college_gpa: number | null;
+  // Household members (declared on the Apply form) -> per-capita income,
+  // the feature that lets the model separate equal incomes by household size.
+  family_size?: number | null;
   hasItr: boolean;
   // statutory priority data (same fields the historical preprocessing derives)
   disability?: string | null;
@@ -63,6 +69,7 @@ interface ChedForm {
     application_status?: string;
     application_date?: string;
     scholarship_id?: number | null;
+    application_data?: { itr_file?: string | null; itr_file_p2?: string | null } | null;
     scholarship_programs?: { scholarship_name: string } | { scholarship_name: string }[];
     student_accounts?: {
       last_name?: string;
@@ -92,6 +99,7 @@ interface ChedForm {
     application_status?: string;
     application_date?: string;
     scholarship_id?: number | null;
+    application_data?: { itr_file?: string | null; itr_file_p2?: string | null } | null;
     scholarship_programs?: { scholarship_name: string } | { scholarship_name: string }[];
     student_accounts?: {
       last_name?: string;
@@ -161,12 +169,192 @@ function restoreSavedRankings(
       ocr_match_pct: null,
       ocr_status: "OCR details not saved",
       financial_need_score: null,
-      itr_path: form?.income_tax_return ?? null,
+      itr_path: application?.application_data?.itr_file ?? form?.income_tax_return ?? null,
+      itr_path_p2: application?.application_data?.itr_file_p2 ?? null,
       year_level: student?.year_level ?? form?.year_level ?? null,
       sex: student?.sex ?? form?.sex ?? null,
       savedResultOnly: true,
     };
   });
+}
+
+/**
+ * The ranking table in Supabase only stores {application_id, position, score,
+ * prediction, date}. Everything else an admin actually looks at - per-document
+ * OCR readings, the OCR/scan analytics, the training analytics and the run log
+ * - lives only in React state, so leaving this page (or refreshing) threw it
+ * away and the rows came back marked "OCR details not saved".
+ *
+ * This mirrors the finished run into localStorage so the rich state survives
+ * navigation. Supabase stays the source of truth for *which* rows are saved;
+ * this only re-attaches the detail, and only when it is at least as new as the
+ * saved rows (so a ranking saved by another admin still wins).
+ */
+const SESSION_KEY = "ml-ranking-session-v5";
+
+interface RankingSession {
+  savedAt: string;
+  programId: number | null;
+  ranked: RankedRow[];
+  ocrAnalytics: ScanAnalytics | null;
+  trainInfo: TrainInfo | null;
+  docs: DocUi[];
+  logLines: LogLine[];
+}
+
+function loadSession(): RankingSession | null {
+  try {
+    const raw = window.localStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as RankingSession;
+    if (!parsed || !Array.isArray(parsed.ranked) || !parsed.ranked.length) return null;
+    if (typeof parsed.savedAt !== "string") return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function saveSession(session: RankingSession) {
+  try {
+    window.localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+  } catch {
+    // Quota exceeded (private mode / very large run). Retry without the bulky
+    // per-document detail so the ranking itself still survives navigation.
+    try {
+      window.localStorage.setItem(
+        SESSION_KEY,
+        JSON.stringify({ ...session, docs: [], logLines: [] }),
+      );
+    } catch {
+      /* persistence is best-effort - never break a run over it */
+    }
+  }
+}
+
+function clearSession() {
+  try {
+    window.localStorage.removeItem(SESSION_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+/* -------------------------------------------------------------- history ---
+ * SESSION_KEY above keeps only the LATEST finished run. Both panels also need
+ * an audit trail: every training / ranking / OCR run with its full execution
+ * log and its analytics, so accuracy, model persistence and the OCR match /
+ * mismatch rate of run N can be compared against run N-1 without rerunning
+ * anything. Kept in localStorage - Supabase's ranking_result table has no
+ * column for logs or metrics.
+ */
+const RUN_HISTORY_KEY = "ml-run-history-v1";
+const RUN_HISTORY_LIMIT = 40;        // oldest runs fall off the end
+const RUN_HISTORY_LOG_LINES = 800;   // per run - long enough for a full train log
+
+type HistoryFilter = "all" | "train" | "rank";
+
+interface RunHistoryEntry {
+  id: string;
+  mode: "scan" | "rank" | "train";
+  finishedAt: string; // ISO timestamp of the run's completion
+  label: string; // training file name, or the scholarship program ranked
+  seconds: number;
+  rankedCount: number;
+  error: string;
+  logs: LogLine[];
+  trainInfo: TrainInfo | null;
+  ocrAnalytics: ScanAnalytics | null;
+}
+
+function loadRunHistory(): RunHistoryEntry[] {
+  try {
+    const raw = window.localStorage.getItem(RUN_HISTORY_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as RunHistoryEntry[];
+    return Array.isArray(parsed) ? parsed.filter((run) => run && run.id) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Append a finished run to the stored trail (newest first) and return it. */
+function recordRun(entry: RunHistoryEntry): RunHistoryEntry[] {
+  const next = [entry, ...loadRunHistory()].slice(0, RUN_HISTORY_LIMIT);
+  const write = (list: RunHistoryEntry[]) =>
+    window.localStorage.setItem(RUN_HISTORY_KEY, JSON.stringify(list));
+  try {
+    write(next);
+  } catch {
+    // Quota exceeded (private mode / log-heavy runs): keep the trail itself
+    // and shed only the bulky per-run logs, newest run last so its proof of
+    // what the model did survives.
+    try {
+      write(next.map((run, i) => (i === 0 ? run : { ...run, logs: run.logs.slice(0, 30) })));
+    } catch {
+      try {
+        write(
+          next.slice(0, 15).map((run, i) => ({ ...run, logs: run.logs.slice(0, i === 0 ? 200 : 10) })),
+        );
+      } catch {
+        /* history is best-effort - never break a run over it */
+      }
+    }
+  }
+  return next;
+}
+
+function clearRunHistory() {
+  try {
+    window.localStorage.removeItem(RUN_HISTORY_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+/* ----------------------------------------------------- training row count --
+ * "How many rows does my uploaded file have?" - answered by
+ * GET /api/ml/training-rows (backend/ml/rows_report.py). That report is
+ * strictly aggregate: row count, column names and how many rows carry TOINC /
+ * NPCINC. No row values are returned, so no household record ever reaches the
+ * browser. Cached per file identity so the count is not recomputed on every
+ * render or page load.
+ */
+interface RowsReport {
+  available: boolean;
+  file?: string;
+  size?: number;
+  updated_at?: string;
+  sheet?: string;
+  rows?: number;
+  columns?: number;
+  headers?: string[];
+  populated?: Record<string, number>;
+  trainable_rows?: number;
+  required?: string[];
+  warnings?: string[];
+  error?: string;
+}
+
+const ROWS_CACHE_KEY = "ml-training-rows-v1";
+
+function loadRowsCache(): { key: string; report: RowsReport } | null {
+  try {
+    const raw = window.localStorage.getItem(ROWS_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { key: string; report: RowsReport };
+    return parsed && typeof parsed.key === "string" && parsed.report ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveRowsCache(key: string, report: RowsReport) {
+  try {
+    window.localStorage.setItem(ROWS_CACHE_KEY, JSON.stringify({ key, report }));
+  } catch {
+    /* best-effort - the count is re-fetched next time */
+  }
 }
 
 interface MatchInfo {
@@ -178,6 +366,11 @@ interface MatchInfo {
 
 interface DocRecord {
   path: string;
+  page_no?: number;
+  // Optional second ITR page (BIR 1701-MS Page 2).
+  path2?: string | null;
+  income_page?: number | null;
+  image2?: { width?: number; height?: number; bytes?: number };
   application_id?: number | null;
   student_name?: string | null;
   declared_income?: number | null;
@@ -207,6 +400,17 @@ interface DocRecord {
   need_score?: number | null;
   image?: { width?: number; height?: number; bytes?: number };
   preview?: Array<{ text: string; score: number }>;
+  itr_fields?: Array<{
+    field: string;
+    label: string;
+    kind: "income" | "tax" | "source";
+    page: number;
+    value: number | string;
+    confidence: number;
+    method: string;
+    anchor?: string | null;
+    amount_line?: string | null;
+  }>;
 }
 
 interface DocUi extends DocRecord {
@@ -322,6 +526,7 @@ interface RankedRow {
   financial_need_score: number | null;
   priority_target?: number;
   itr_path: string | null;
+  itr_path_p2?: string | null;
   year_level: string | null;
   sex: string | null;
   savedResultOnly?: boolean;
@@ -373,6 +578,267 @@ function incomeDistribution(values: Array<number | null | undefined>) {
   });
 }
 
+/* ---------------------------------------------------------- run history ---
+ * One card, both panels: every finished training / ranking / OCR run with its
+ * key numbers on one line and the full execution log + analytics behind a
+ * click. Training runs show holdout accuracy, persistence and feature
+ * importance; ranking / OCR runs show the read rate and the declared-vs-OCR
+ * match / mismatch counts the ranking table reports.
+ */
+function runChips(run: RunHistoryEntry): Array<{ label: string; value: string; title: string }> {
+  const ti = run.trainInfo;
+  const an = run.ocrAnalytics;
+  const chips: Array<{ label: string; value: string; title: string }> = [];
+  if (run.mode === "train") {
+    chips.push({ label: "rows", value: (ti?.n_samples ?? 0).toLocaleString(), title: "Training rows fitted (uploaded file only)" });
+    chips.push({ label: "trees", value: String(ti?.n_trees ?? "\u2014"), title: "Random Forest n_estimators" });
+    chips.push({
+      label: "accuracy",
+      value: ti?.evaluation?.available ? fpct(ti.accuracy, 1) : "not evaluated",
+      title: ti?.evaluation?.available
+        ? `Held-out accuracy against ${ti?.evaluation?.source}`
+        : "No observed NPCINC labels were available for evaluation",
+    });
+    chips.push({ label: "F1", value: ti?.evaluation?.available ? fpct(ti.f1, 1) : "\u2014", title: "Priority-class F1 on the held-out split" });
+    chips.push({
+      label: "storage",
+      value: ti?.persisted ? "saved" : "not saved",
+      title: ti?.persisted
+        ? "Model + analytics were written to Supabase Storage (reused by Execute AI Ranking)"
+        : "Model could not be persisted - later rankings cannot reuse it",
+    });
+  } else {
+    if (an) {
+      chips.push({ label: "ITR read", value: `${an.income_detected}/${an.documents_scanned}`, title: "Documents where a priority row carried a value" });
+      chips.push({ label: "no value", value: String(an.income_not_detected), title: "Scanned but none of the priority rows had a value (not cleared)" });
+      chips.push({ label: "exact", value: `${an.exact_matches}/${an.comparable}`, title: "OCR value equals the declared annual income" });
+      chips.push({ label: "mismatch", value: String(an.mismatches), title: "OCR value differs from the declared annual income" });
+      chips.push({ label: "align", value: pct(an.typed_accuracy_pct ?? an.avg_align_pct), title: "Average alignment of OCR and declared income" });
+    }
+    chips.push({ label: "ranked", value: String(run.rankedCount), title: "Applicants ranked by the Random Forest" });
+    if (ti) {
+      chips.push({ label: "model acc.", value: ti.evaluation?.available ? fpct(ti.accuracy, 1) : "\u2014", title: "Holdout accuracy of the model used for this ranking" });
+      chips.push({ label: "model", value: ti.external || ti.model_source === "external" ? "trained file" : "fresh fit", title: ti.model_path || "Model file used to score the applicants" });
+    }
+  }
+  return chips;
+}
+
+/** Metric tiles for an expanded history row - the details an admin compares. */
+function runDetailTiles(run: RunHistoryEntry): Array<{ label: string; value: string; title?: string }> {
+  const ti = run.trainInfo;
+  const an = run.ocrAnalytics;
+  const tiles: Array<{ label: string; value: string; title?: string }> = [];
+  if (ti) {
+    const ev = ti.evaluation;
+    tiles.push({ label: "Accuracy", value: ev?.available ? fpct(ti.accuracy, 2) : "Not evaluated", title: ev ? `Held-out against ${ev.source}` : undefined });
+    tiles.push({ label: "Precision", value: ev?.available ? fpct(ti.precision, 2) : "Not evaluated" });
+    tiles.push({ label: "Recall", value: ev?.available ? fpct(ti.recall, 2) : "Not evaluated" });
+    tiles.push({ label: "F1", value: ev?.available ? fpct(ti.f1, 2) : "Not evaluated" });
+    tiles.push({ label: "ROC-AUC", value: ev?.available ? fpct(ti.roc_auc, 2) : "Not evaluated" });
+    tiles.push({
+      label: "Confusion",
+      value: ti.confusion_matrix?.length ? ti.confusion_matrix.map((row) => `[${row.join(", ")}]`).join(" ") : "\u2014",
+      title: "[[TN, FP], [FN, TP]] on the held-out split",
+    });
+    tiles.push({ label: "Holdout split", value: ev?.available ? `${ev.n_train.toLocaleString()} / ${ev.n_test.toLocaleString()}` : "\u2014", title: "train / test rows" });
+    tiles.push({ label: "Rows", value: `${(ti.n_samples ?? 0).toLocaleString()} (file ${(ti.n_csv ?? 0).toLocaleString()}, real ${ti.n_real ?? 0}, synth ${ti.n_synthetic ?? 0})` });
+    tiles.push({ label: "Trees / seed", value: `${ti.n_trees} / ${ti.seed}` });
+    tiles.push({
+      label: "Hyperparameters",
+      value: `max_depth=${ti.model_params?.max_depth ?? "\u2014"}, min_samples_leaf=${ti.model_params?.min_samples_leaf ?? "\u2014"}, class_weight=${ti.model_params?.class_weight ?? "\u2014"}`,
+    });
+    tiles.push({ label: "Labels", value: ti.dataset?.label_sources ? `${ti.dataset.label_sources.observed_npcinc.toLocaleString()} observed NPCINC / ${ti.dataset.label_sources.derived_proxy.toLocaleString()} proxy` : ev?.source ?? "\u2014" });
+    tiles.push({ label: "Model", value: `${ti.persisted ? "persisted" : "runtime only"} \u00b7 ${ti.model_id ? ti.model_id.slice(0, 12) : "id unavailable"}`, title: ti.model_path });
+    if (ti.feature_columns?.length) {
+      tiles.push({ label: "Features", value: ti.feature_columns.join(", "), title: "The exact columns the forest was fitted on" });
+    }
+  }
+  if (an) {
+    tiles.push({ label: "ITRs scanned", value: `${an.documents_scanned} of ${an.documents_in_bucket}` });
+    tiles.push({ label: "Priority row read", value: `${an.income_detected} (${pct(an.detection_rate_pct)})`, title: "Documents where priority 1, 2 or 3 carried a value" });
+    tiles.push({ label: "Not cleared", value: String(an.income_not_detected), title: "None of the three priority rows carried a value" });
+    tiles.push({ label: "Scan failures", value: String(an.scan_failures) });
+    tiles.push({ label: "Comparable pairs", value: String(an.comparable), title: "Rows with both a declared income and an OCR value" });
+    tiles.push({ label: "Exact matches", value: `${an.exact_matches} (${pct(an.match_rate_pct)})` });
+    tiles.push({ label: "Mismatches", value: String(an.mismatches), title: "OCR value differs from what the student declared" });
+    tiles.push({ label: "Avg alignment", value: pct(an.typed_accuracy_pct ?? an.avg_align_pct, 2) });
+    tiles.push({ label: "Avg confidence", value: pct(an.avg_confidence == null ? null : an.avg_confidence * 100) });
+    tiles.push({ label: "OCR time", value: `${(an.total_ocr_ms / 1000).toFixed(1)}s`, title: `engine load ${(an.engine_load_ms / 1000).toFixed(1)}s \u00b7 ${an.scan_seconds > 0 ? `${an.scan_seconds.toFixed(1)}s scan` : "cached"}` });
+    tiles.push({ label: "Engine", value: String(an.engine?.engine ?? "unavailable"), title: String(an.engine?.runtime ?? an.engine?.status ?? "") });
+  }
+  return tiles;
+}
+
+function RunHistoryCard({
+  entries,
+  filter,
+  onFilter,
+  expandedId,
+  onExpand,
+  onClear,
+}: {
+  entries: RunHistoryEntry[];
+  filter: HistoryFilter;
+  onFilter: (value: HistoryFilter) => void;
+  expandedId: string | null;
+  onExpand: (id: string | null) => void;
+  onClear: () => void;
+}) {
+  const shown = entries.filter((run) =>
+    filter === "all" ? true : filter === "train" ? run.mode === "train" : run.mode !== "train",
+  );
+  const countFor = (value: HistoryFilter) =>
+    value === "all"
+      ? entries.length
+      : value === "train"
+        ? entries.filter((run) => run.mode === "train").length
+        : entries.filter((run) => run.mode !== "train").length;
+  const filters: Array<{ value: HistoryFilter; label: string }> = [
+    { value: "all", label: "All runs" },
+    { value: "train", label: "Training data" },
+    { value: "rank", label: "OCR + ranking" },
+  ];
+
+  return (
+    <section
+      id="run-history"
+      className="scroll-mt-24 overflow-hidden rounded-2xl border border-[#7B1113]/20 bg-white shadow-sm"
+    >
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#7B1113]/15 bg-gradient-to-r from-[#7B1113]/[0.06] to-white px-5 py-4">
+        <div>
+          <p className="text-sm font-bold text-[#241012]">
+            Run history &mdash; execution logs &amp; analytics
+            <span className="ml-2 inline-flex items-center gap-1 rounded-full bg-[#241012]/[0.06] px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-[#6B5458]">
+              {entries.length} run{entries.length === 1 ? "" : "s"} kept
+            </span>
+          </p>
+          <p className="mt-0.5 text-[11px] text-[#6B5458]">
+            Every Execute Training Data, Execute AI Ranking and OCR scan keeps its full log and metrics here &mdash;
+            newest first. Expand a row for the Random Forest metrics, the OCR read / match counts and the whole
+            execution log.
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          {filters.map((item) => (
+            <button
+              key={item.value}
+              onClick={() => onFilter(item.value)}
+              className={`rounded-lg px-3 py-1.5 text-[11px] font-bold transition ${
+                filter === item.value
+                  ? "bg-[#7B1113] text-white"
+                  : "border border-[#7B1113]/30 text-[#7B1113] hover:bg-[#7B1113]/5"
+              }`}
+            >
+              {item.label} ({countFor(item.value)})
+            </button>
+          ))}
+          {entries.length > 0 && (
+            <button
+              onClick={onClear}
+              className="rounded-lg border border-[#241012]/20 px-3 py-1.5 text-[11px] font-bold text-[#6B5458] hover:bg-[#FAF7F5]"
+              title="Delete the stored run history from this browser"
+            >
+              Clear history
+            </button>
+          )}
+        </div>
+      </div>
+
+      {shown.length === 0 ? (
+        <p className="px-5 py-6 text-[12px] text-[#6B5458]">
+          {entries.length === 0
+            ? "No runs recorded yet. Execute Training Data or Execute AI Ranking and its log, metrics and OCR analytics will be archived here."
+            : "No run matches this filter."}
+        </p>
+      ) : (
+        <div>
+          {shown.map((run) => {
+            const open = expandedId === run.id;
+            const chips = runChips(run);
+            const tiles = runDetailTiles(run);
+            const modeLabel =
+              run.mode === "train" ? "Training data" : run.mode === "scan" ? "OCR scan" : "AI ranking";
+            return (
+              <div key={run.id} className="border-b border-[#241012]/[0.07] last:border-b-0">
+                <button
+                  onClick={() => onExpand(open ? null : run.id)}
+                  className="flex w-full flex-wrap items-center gap-x-3 gap-y-2 px-5 py-3 text-left transition hover:bg-[#FAF7F5]/70"
+                  aria-expanded={open}
+                >
+                  <span
+                    className={`inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-[10px] font-bold uppercase tracking-wide ${
+                      run.mode === "train"
+                        ? "bg-[#7B1113]/10 text-[#7B1113]"
+                        : "bg-emerald-500/10 text-emerald-700"
+                    }`}
+                  >
+                    <span className={`h-1.5 w-1.5 rounded-full ${run.error ? "bg-red-500" : run.mode === "train" ? "bg-[#7B1113]" : "bg-emerald-500"}`} />
+                    {modeLabel}
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-[12px] font-bold text-[#241012]">{run.label}</span>
+                    <span className="block text-[10px] text-[#6B5458]">
+                      {new Date(run.finishedAt).toLocaleString("en-PH")} &middot; {run.seconds}s &middot;{" "}
+                      {run.logs.length.toLocaleString()} log line{run.logs.length === 1 ? "" : "s"}
+                      {run.error ? <span className="ml-1 font-semibold text-red-600"> &middot; failed: {run.error}</span> : null}
+                    </span>
+                  </span>
+                  <span className="flex flex-wrap items-center gap-1.5">
+                    {chips.map((chip) => (
+                      <span
+                        key={chip.label}
+                        title={chip.title}
+                        className="rounded-md bg-[#FAF7F5] px-2 py-1 text-[10px] text-[#6B5458] ring-1 ring-[#241012]/[0.06]"
+                      >
+                        {chip.label} <b className="text-[#241012]">{chip.value}</b>
+                      </span>
+                    ))}
+                  </span>
+                  <span className="shrink-0 text-[10px] font-bold uppercase tracking-wide text-[#7B1113]">
+                    {open ? "Hide" : "Details + log"}
+                  </span>
+                </button>
+
+                {open && (
+                  <div className="border-t border-[#241012]/[0.07] bg-[#FAF7F5]/60 px-5 py-4">
+                    {tiles.length > 0 && (
+                      <div className="grid grid-cols-2 gap-px overflow-hidden rounded-xl bg-[#241012]/[0.07] sm:grid-cols-3 lg:grid-cols-4">
+                        {tiles.map((tile) => (
+                          <div key={tile.label} className="bg-white px-3 py-2">
+                            <p className="text-[9px] font-extrabold uppercase tracking-wide text-[#6B5458]" title={tile.title}>
+                              {tile.label}
+                            </p>
+                            <p className="mt-0.5 break-words text-[11px] font-bold text-[#241012]" title={tile.title}>
+                              {tile.value}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    <p className="mt-3 text-[10px] font-bold uppercase tracking-wide text-[#6B5458]">
+                      Execution log ({run.logs.length} line{run.logs.length === 1 ? "" : "s"})
+                    </p>
+                    <div className="mt-1.5 max-h-80 overflow-y-auto rounded-xl bg-[#241012] p-3 font-mono text-[10px] leading-relaxed text-[#F3E9EA]">
+                      {run.logs.length === 0 && <p className="text-[#8B7376]">No log lines were captured for this run.</p>}
+                      {run.logs.map((line, i) => (
+                        <p key={i} className={line.stderr ? "text-[#FF9A9A]" : undefined}>
+                          {line.t != null ? <span className="text-[#8B7376]">[{line.t.toFixed(1)}s] </span> : null}
+                          {line.msg}
+                        </p>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
 export default function MLRankingPage() {
   const router = useRouter();
   const [loading, setLoading] = useState(true);
@@ -385,6 +851,7 @@ export default function MLRankingPage() {
   const [selectedProgramId, setSelectedProgramId] = useState<number | null>(null);
 
   const [busy, setBusy] = useState<null | "scan" | "rank" | "train">(null);
+  const [progressVisible, setProgressVisible] = useState(false);
   const [savedCount, setSavedCount] = useState(0);
   const [savedBusy, setSavedBusy] = useState(false);
   const [phase, setPhase] = useState<Phase>("scanning");
@@ -398,6 +865,11 @@ export default function MLRankingPage() {
   const [savedRankings, setSavedRankings] = useState<SavedRanking[]>([]);
   const [expanded, setExpanded] = useState<number | null>(null);
   const [histFile, setHistFile] = useState<{ name: string; size: number; updated_at?: string } | null>(null);
+  // Row report for that file: how many rows it has, and whether TOINC/NPCINC
+  // are on every row - counts only, never the data itself.
+  const [rowsInfo, setRowsInfo] = useState<RowsReport | null>(null);
+  const [rowsBusy, setRowsBusy] = useState(false);
+  const [rowsError, setRowsError] = useState("");
   const [histBusy, setHistBusy] = useState(false);
   const [histError, setHistError] = useState("");
   const histInputRef = useRef<HTMLInputElement | null>(null);
@@ -413,8 +885,17 @@ export default function MLRankingPage() {
     error: string;
   } | null>(null);
   const logLinesRef = useRef<LogLine[]>([]);
+  // Set by a run that actually produced results, so the persist effect below
+  // never overwrites a good saved session with an empty/aborted run.
+  const persistRef = useRef(false);
   const [showTrainLog, setShowTrainLog] = useState(false);
   const [showRankLog, setShowRankLog] = useState(false);
+  // Audit trail of every finished run (training / ranking / OCR) with its
+  // full log + analytics, so past model metrics stay readable after a rerun.
+  const [runHistory, setRunHistory] = useState<RunHistoryEntry[]>([]);
+  const [historyFilter, setHistoryFilter] = useState<HistoryFilter>("all");
+  const [expandedRunId, setExpandedRunId] = useState<string | null>(null);
+  const [showStandaloneLog, setShowStandaloneLog] = useState(false);
 
   const logRef = useRef<HTMLDivElement | null>(null);
 
@@ -525,6 +1006,7 @@ export default function MLRankingPage() {
         sb.from("ched_form_input")
           .select(`*, scholarship_applications!inner(
                application_id, application_status, application_date,
+               application_data,
                scholarship_programs(scholarship_name),
                student_accounts(last_name, given_name, middle_name, ext_name, student_number, program_name, year_level, sex, birthdate, registration_status)
              )`)
@@ -547,7 +1029,33 @@ export default function MLRankingPage() {
       if (!chedQ.error) setChedForms(loadedForms);
       if (!rankQ.error) {
         setSavedRankings(loadedRankings);
-        setRanked(restoreSavedRankings(loadedRankings, loadedForms));
+        const restored = restoreSavedRankings(loadedRankings, loadedForms);
+        // Prefer the mirrored session (OCR readings, analytics, logs) over the
+        // bare Supabase rows, but only when it is at least as new as the newest
+        // saved ranking — otherwise another admin's later save wins.
+        const newestSaved = loadedRankings.reduce<string>(
+          (max, r) => (r.generated_date && r.generated_date > max ? r.generated_date : max),
+          "",
+        );
+        const session = !ignore ? loadSession() : null;
+        if (session && (!newestSaved || session.savedAt >= newestSaved)) {
+          setRanked(session.ranked);
+          setOcrAnalytics(session.ocrAnalytics);
+          setTrainInfo(session.trainInfo);
+          setDocs(session.docs);
+          setLogLines(session.logLines);
+          logLinesRef.current = session.logLines;
+          setLastRun({
+            mode: "rank",
+            finishedAt: new Date(session.savedAt).toLocaleTimeString("en-PH"),
+            logs: session.logLines,
+            trainInfo: session.trainInfo,
+            rankedCount: session.ranked.length,
+            error: "",
+          });
+        } else {
+          setRanked(restored);
+        }
       }
       setPendingCount(pendingQ.data?.length ?? 0);
       if (!savedQ.error) setSavedCount(savedQ.count ?? 0);
@@ -579,10 +1087,77 @@ export default function MLRankingPage() {
     return () => window.clearInterval(timer);
   }, [busy]);
 
+  // Re-attach the finished run's detail once the modal closes. Supabase keeps
+  // the ranking rows; localStorage keeps the OCR readings, analytics and logs
+  // that the ranking table has nowhere to store.
+  useEffect(() => {
+    if (!persistRef.current || busy !== null) return;
+    persistRef.current = false;
+    saveSession({
+      savedAt: new Date().toISOString(),
+      programId: selectedProgramId,
+      ranked,
+      ocrAnalytics,
+      trainInfo,
+      docs,
+      logLines,
+    });
+  }, [busy, ranked, ocrAnalytics, trainInfo, docs, logLines, selectedProgramId]);
+
   useEffect(() => {
     const node = logRef.current;
     if (node) node.scrollTop = node.scrollHeight;
   }, [logLines]);
+
+  // Restore the run audit trail (logs + analytics of past runs) on mount.
+  useEffect(() => {
+    setRunHistory(loadRunHistory());
+  }, []);
+
+  // How many rows does the uploaded training file have? Counts only -
+  // backend/ml/rows_report.py never returns a row's values.
+  useEffect(() => {
+    if (!histFile) {
+      setRowsInfo(null);
+      setRowsError("");
+      return;
+    }
+    const key = `${histFile.name}:${histFile.size}:${histFile.updated_at ?? ""}`;
+    const cached = loadRowsCache();
+    if (cached && cached.key === key) {
+      setRowsInfo(cached.report);
+      setRowsError("");
+      return;
+    }
+    let ignore = false;
+    setRowsBusy(true);
+    setRowsError("");
+    (async () => {
+      try {
+        const res = await fetch("/api/ml/training-rows", { cache: "no-store" });
+        const json = (await res.json().catch(() => null)) as RowsReport | null;
+        if (ignore) return;
+        if (!res.ok || !json || json.available === false) {
+          setRowsInfo(null);
+          setRowsError(json?.error || `Row count unavailable (HTTP ${res.status}).`);
+        } else {
+          setRowsInfo(json);
+          // Only cache when the report is for THIS file, so a replace-file
+          // race can never pin an older count to a newer upload.
+          if (!json.updated_at || !histFile.updated_at || json.updated_at === histFile.updated_at) {
+            saveRowsCache(key, json);
+          }
+        }
+      } catch (err) {
+        if (!ignore) setRowsError(err instanceof Error ? err.message : "Row count unavailable.");
+      } finally {
+        if (!ignore) setRowsBusy(false);
+      }
+    })();
+    return () => {
+      ignore = true;
+    };
+  }, [histFile]);
 
   async function viewItr(itrPath: string) {
     const sb = getSupabase();
@@ -601,7 +1176,7 @@ export default function MLRankingPage() {
     try {
       const res = await fetch("/api/storage/signed-url", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...(await authHeaders()) },
         body: JSON.stringify({ bucket: "itr-documents", paths: [itrPath] }),
       });
       const payload = (await res.json()) as { urls?: Record<string, string>; error?: string };
@@ -643,9 +1218,21 @@ export default function MLRankingPage() {
       const sa = Array.isArray(app.student_accounts) ? app.student_accounts[0] : app.student_accounts;
       const sp = Array.isArray(app.scholarship_programs) ? app.scholarship_programs[0] : app.scholarship_programs;
       const form = formMap[app.application_id];
-      const applicationData = (app.application_data || {}) as { annual_income_family?: number; itr_file?: string };
+      const applicationData = (app.application_data || {}) as {
+        annual_income_family?: number;
+        family_size?: number | null;
+        itr_file?: string;
+        itr_file_p2?: string;
+      };
       const income = form?.annual_income_family ?? applicationData.annual_income_family ?? null;
+      const familySize =
+        typeof applicationData.family_size === "number" &&
+        Number.isFinite(applicationData.family_size) &&
+        applicationData.family_size >= 1
+          ? applicationData.family_size
+          : null;
       const itrPath = form?.income_tax_return ?? applicationData.itr_file ?? null;
+      const itrPathP2 = applicationData.itr_file_p2 ?? null;
       const acad = acadByStudent.get(Number(app.student_id));
       const birthdate = form?.birthdate ?? sa?.birthdate ?? null;
       let age: number | null = null;
@@ -664,12 +1251,14 @@ export default function MLRankingPage() {
         scholarship: sp?.scholarship_name ?? "",
         program: sa?.program_name ?? null,
         annual_income_family: income ?? null,
+        family_size: familySize,
         itr_path: itrPath ?? null,
+        itr_path_p2: itrPathP2,
         year_level: form?.year_level ?? sa?.year_level ?? null,
         sex: form?.sex ?? sa?.sex ?? null,
         shs_gwa: form?.shs_gwa ?? acad?.shs_gwa ?? null,
         college_gpa: form?.college_gpa ?? acad?.college_gpa ?? null,
-        hasItr: !!itrPath,
+        hasItr: !!(itrPath || itrPathP2),
         // statutory priority fields (CHED form has no solo-parent / 4Ps /
         // first-gen column yet - they arrive as null and score 0)
         disability: form?.disability ?? null,
@@ -685,7 +1274,7 @@ export default function MLRankingPage() {
 
   function pushLog(line: LogLine) {
     setLogLines((prev) => {
-      const next = prev.length > 400 ? prev.slice(-300) : prev.slice();
+      const next = prev.length > 2500 ? prev.slice(-2000) : prev.slice();
       next.push(line);
       logLinesRef.current = next;
       return next;
@@ -710,11 +1299,17 @@ export default function MLRankingPage() {
     setMessage("");
     setError("");
     setBusy(runMode);
+    setProgressVisible(true);
+    setShowStandaloneLog(false);
+    setShowTrainLog(false);
+    setShowRankLog(false);
+    setLastRun(null);
     setPhase("scanning");
     setElapsed(0);
     setProgress({ done: 0, total: 0 });
     setDocs([]);
     setLogLines([]);
+    logLinesRef.current = [];
     if (isTrain) {
       setOcrAnalytics(null);
       setTrainInfo(null);
@@ -743,36 +1338,42 @@ export default function MLRankingPage() {
     let finalAnalytics: ScanAnalytics | null = null;
     let finalRows: RankedRow[] = [];
     let finalTrainInfo: TrainInfo | null = null;
+    const applicantsById = new Map<number, Applicant>();
 
     try {
       const applicants = isTrain ? [] : await buildApplicants();
+      applicants.forEach((applicant) => applicantsById.set(applicant.application_id, applicant));
       if (!isTrain && !applicants.length) {
-        setError(`No pending application is waiting under "${programName}". Choose another program or wait for students to apply.`);
+        localError = `No pending application is waiting under "${programName}". Choose another program or wait for students to apply.`;
+        setError(localError);
+        pushLog({ msg: localError, stderr: true });
         setBusy(null);
         return;
       }
-      const eligible = applicants.filter((a) => a.hasItr && a.annual_income_family != null);
+      const eligible = applicants.filter((a) => a.hasItr);
       if (runMode === "rank" && !eligible.length) {
         // Training must never be blocked by missing ITR / income: the Random
         // Forest still fits on the synthetic + historical rows, and every
         // applicant without income trains with the neutral need score (50).
         pushLog({
           msg:
-            "No pending applicant has an uploaded ITR with income data - continuing anyway. "
-          + "The model uses declared income when available; OCR only compares the ITR against it. "
-          + "Applicants without declared income are still scored with the model's missing-value handling.",
+            "No pending applicant has an uploaded ITR - continuing anyway. "
+          + "Declared annual income is the model input; OCR is an audit comparison only. "
+          + "Applicants without declared income are scored with the model's missing-value handling.",
         });
       }
 
-      const queued = isTrain ? [] : applicants.filter((a) => a.itr_path);
+      const queued = isTrain ? [] : applicants.filter((a) => a.itr_path || a.itr_path_p2);
       setProgress({ done: 0, total: queued.length });
       if (queued.length) {
         setDocs(
           queued.map((a, i) => ({
-            path: a.itr_path as string,
+            path: (a.itr_path || a.itr_path_p2) as string,
             application_id: a.application_id,
             student_name: a.student_name,
             declared_income: a.annual_income_family ?? null,
+            path2: a.itr_path && a.itr_path_p2 ? a.itr_path_p2 : undefined,
+            page_no: a.itr_path ? 1 : 2,
             index: i + 1,
             total: queued.length,
             status: "queued",
@@ -780,7 +1381,9 @@ export default function MLRankingPage() {
         );
         pushLog({ msg: `Queued ${queued.length} ITR document(s) for OCR scanning:` });
         queued.forEach((a, i) =>
-          pushLog({ msg: `  [${i + 1}/${queued.length}] ${a.itr_path} - ${a.student_name} (typed ${peso(a.annual_income_family)})` }),
+          pushLog({
+            msg: `  [${i + 1}/${queued.length}] ${a.itr_path || a.itr_path_p2}${a.itr_path && a.itr_path_p2 ? ` + ${a.itr_path_p2}` : ""} - ${a.student_name} (declared ${peso(a.annual_income_family)})`,
+          }),
         );
       } else if (!isTrain) {
         pushLog({ msg: "No ITR file is linked to an applicant in this program; no documents will be scanned." });
@@ -817,7 +1420,9 @@ export default function MLRankingPage() {
             scholarship: a.scholarship,
             program: a.program,
             declared_income: a.annual_income_family,
+            family_size: a.family_size,
             itr_path: a.itr_path,
+            itr_path_p2: a.itr_path_p2,
             year_level: a.year_level,
             sex: a.sex,
             shs_gwa: a.shs_gwa,
@@ -866,7 +1471,25 @@ export default function MLRankingPage() {
           if (type === "log") {
             pushLog({ t: event.t as number | undefined, msg: String(event.msg ?? ""), stderr: event.stream === "stderr" });
           } else if (type === "start") {
-            // stack / weights info no longer displayed - ranking rules card explains the model
+            const weights = (event.weights || {}) as Record<string, unknown>;
+            const stack = (event.stack || {}) as Record<string, unknown>;
+            const limits = (event.limits || {}) as Record<string, unknown>;
+            pushLog({
+              t: event.t as number | undefined,
+              msg: `Pipeline started: mode=${String(event.mode)}, applicants=${Number(event.applicants) || 0}, seed=${Number(event.seed) || 0}, trees=${Number(event.n_trees) || 0}.`,
+            });
+            pushLog({
+              t: event.t as number | undefined,
+              msg: `Ranking weights: need=${String(weights.need ?? "n/a")}, OCR=${String(weights.ocr ?? "n/a")}, academics=${String(weights.academic ?? "n/a")}; declared income is the model income and OCR is audit-only.`,
+            });
+            pushLog({
+              t: event.t as number | undefined,
+              msg: `Income thresholds: floor=${String(limits.income_floor ?? "n/a")}, ceiling=${String(limits.income_ceil ?? "n/a")}, high-need=${String(limits.high_need_income ?? "n/a")}.`,
+            });
+            pushLog({
+              t: event.t as number | undefined,
+              msg: `Runtime: Python ${String(stack.python ?? "n/a")}, NumPy ${String(stack.numpy ?? "n/a")}, scikit-learn ${String(stack["scikit-learn"] ?? "n/a")}, RapidOCR ${String(stack["rapidocr-onnxruntime"] ?? "n/a")}, ONNX Runtime ${String(stack.onnxruntime ?? "n/a")}.`,
+            });
           } else if (type === "doc") {
             const index = Number(event.index);
             const total = Number(event.total);
@@ -904,17 +1527,27 @@ export default function MLRankingPage() {
               return next;
             });
             const m = record.match;
+            const student = record.student_name || `application #${record.application_id ?? "?"}`;
             pushLog({
               t: event.t as number | undefined,
               msg:
-                `${record.path} \u2192 ${record.ocr_value != null ? peso(record.ocr_value) : "no value"}` +
+                `${student} | ${record.path}${record.path2 ? ` + ${record.path2}` : ""} \u2192 ${record.ocr_value != null ? peso(record.ocr_value) : "no income detected"}` +
+                (record.income_page ? ` (selected Page ${record.income_page})` : "") +
+                (record.method ? `; method=${record.method}` : "") +
+                (record.anchor ? `; anchor="${record.anchor}"` : "") +
+                (record.amount_line ? `; amount line="${record.amount_line}"` : "") +
+                (record.income_confidence != null ? `; income confidence=${record.income_confidence.toFixed(3)}` : "") +
+                (record.attempts ? `; OCR passes=${record.attempts}` : "") +
+                (record.variant ? `; preprocessing=${record.variant} (${(record.steps || []).join(", ")})` : "") +
                 (m && record.declared_income != null
                   ? m.status === "not_comparable"
-                    ? ` (declared ${peso(record.declared_income)}, income not detected; no match percentage)`
-                    : ` (declared ${peso(record.declared_income)}, ${pct(m.align_pct, 2)} alignment, ${m.status})`
+                    ? `; declared/model income=${peso(record.declared_income)}, no OCR match percentage`
+                    : `; declared/model income=${peso(record.declared_income)}, OCR alignment=${pct(m.align_pct, 2)} (${m.status})`
                   : "") +
-                (record.cached ? " [cached]" : "") +
-                (record.skipped ? ` [skipped: ${record.skipped}]` : ""),
+                `; scan=${record.ocr_ms ?? 0} ms, ${record.line_count ?? 0} detected text lines` +
+                (record.cached ? "; cached result reused" : "") +
+                (record.error ? `; result=${record.error}` : "") +
+                (record.skipped ? `; skipped=${record.skipped}` : ""),
             });
           } else if (type === "scan_progress") {
             setProgress({ done: Number(event.done), total: Number(event.total) });
@@ -924,7 +1557,31 @@ export default function MLRankingPage() {
             finalAnalytics = analytics;
           } else if (type === "preprocess") {
             const rowLabel = event.row_label === "training" ? "training" : "applicant";
-            pushLog({ t: event.t as number | undefined, msg: `Preprocessed ${Array.isArray(event.rows) ? event.rows.length : 0} ${rowLabel} row(s) into ${Array.isArray(event.feature_columns) ? event.feature_columns.length : 0} features (NumPy + median imputation).` });
+            const columns = Array.isArray(event.feature_columns) ? event.feature_columns.map(String) : [];
+            const shape = Array.isArray(event.matrix_shape) ? event.matrix_shape.map(Number) : [];
+            const medians = (event.medians || {}) as Record<string, unknown>;
+            pushLog({
+              t: event.t as number | undefined,
+              msg: `Preprocessed ${Array.isArray(event.rows) ? event.rows.length : 0} ${rowLabel} row(s) into a ${shape[0] ?? 0}x${shape[1] ?? columns.length} feature matrix using NumPy and median imputation.`,
+            });
+            pushLog({
+              t: event.t as number | undefined,
+              msg: `Preprocessing feature order: ${columns.join(", ") || "none"}.`,
+            });
+            if (Object.keys(medians).length) {
+              pushLog({
+                t: event.t as number | undefined,
+                msg: `Preprocessing medians: ${Object.entries(medians).map(([name, value]) => `${name}=${String(value)}`).join(", ")}.`,
+              });
+            }
+            for (const rawRow of (Array.isArray(event.rows) ? event.rows : [])) {
+              const row = rawRow as Record<string, unknown>;
+              if (!row.student_name && row.application_id == null) continue;
+              pushLog({
+                t: event.t as number | undefined,
+                msg: `Preprocessed ${String(row.student_name || `application #${row.application_id}`)}: model income=${row.income_used == null ? "missing" : peso(Number(row.income_used))} (${String(row.income_source || "unknown")}), need=${String(row.financial_need_score ?? "n/a")}/100, OCR audit=${row.ocr_match_pct == null ? "not comparable" : `${String(row.ocr_match_pct)}%`}, target=${String(row.priority_target ?? "n/a")}.`,
+              });
+            }
           } else if (type === "train") {
             setPhase("training");
             setTrainInfo(event as unknown as TrainInfo);
@@ -939,9 +1596,61 @@ export default function MLRankingPage() {
                   ? `Random Forest trained: observed-label holdout accuracy ${event.accuracy != null ? fpct(Number(event.accuracy)) : "n/a"}, F1 ${event.f1 != null ? fpct(Number(event.f1)) : "n/a"}, ROC-AUC ${event.roc_auc != null ? fpct(Number(event.roc_auc), 2) : "n/a"}.`
                   : "Random Forest trained, but no observed NPCINC labels were available for independent evaluation; proxy-label metrics are not reported.",
             });
+            pushLog({
+              t: event.t as number | undefined,
+              msg: `Model details: source=${String(event.model_source || (event.external ? "external" : "trained in this run"))}, ID=${String(event.model_id || "unavailable")}, trained=${String(event.trained_at || "this run or unavailable")}, samples=${Number(event.n_samples) || 0} (CSV=${Number(event.n_csv) || 0}, real=${Number(event.n_real) || 0}, synthetic=${Number(event.n_synthetic) || 0}), trees=${Number(event.n_trees) || 0}, seed=${Number(event.seed) || 0}, fit time=${Number(event.train_ms) || 0} ms.`,
+            });
+            const params = (event.model_params || {}) as Record<string, unknown>;
+            if (Object.keys(params).length) {
+              pushLog({
+                t: event.t as number | undefined,
+                msg: `Random Forest parameters: ${Object.entries(params).map(([name, value]) => `${name}=${String(value)}`).join(", ")}.`,
+              });
+            }
+            const evaluation = (event.evaluation || {}) as Record<string, unknown>;
+            if (evaluation.available) {
+              const confusion = Array.isArray(event.confusion_matrix)
+                ? (event.confusion_matrix as number[][]).map((row) => `[${row.join(", ")}]`).join(" ")
+                : "unavailable";
+              pushLog({
+                t: event.t as number | undefined,
+                msg: `Observed-label holdout: ${String(evaluation.n_train ?? "n/a")} train / ${String(evaluation.n_test ?? "n/a")} test rows; accuracy=${event.accuracy == null ? "n/a" : fpct(Number(event.accuracy))}, precision=${event.precision == null ? "n/a" : fpct(Number(event.precision))}, recall=${event.recall == null ? "n/a" : fpct(Number(event.recall))}, F1=${event.f1 == null ? "n/a" : fpct(Number(event.f1))}, ROC-AUC=${event.roc_auc == null ? "n/a" : fpct(Number(event.roc_auc))}; confusion matrix=${confusion}.`,
+              });
+            } else {
+              pushLog({
+                t: event.t as number | undefined,
+                msg: "No independent holdout accuracy is available for this model run because observed labels were unavailable.",
+              });
+            }
+            if (Array.isArray(event.feature_columns)) {
+              pushLog({
+                t: event.t as number | undefined,
+                msg: `Model feature order: ${(event.feature_columns as string[]).join(", ")}.`,
+              });
+            }
+            pushLog({
+              t: event.t as number | undefined,
+              msg: `Model artifact: ${String(event.model_path || "path unavailable")}; size=${Number(event.model_size_kb) || 0} KB; persistent storage=${event.persisted ? "confirmed" : "not confirmed"}.`,
+            });
+            const importance = (event.feature_importance || {}) as Record<string, unknown>;
+            if (Object.keys(importance).length) {
+              pushLog({
+                t: event.t as number | undefined,
+                msg: `Feature importance: ${Object.entries(importance).sort((a, b) => Number(b[1]) - Number(a[1])).map(([name, value]) => `${name}=${(Number(value) * 100).toFixed(2)}%`).join(", ")}.`,
+              });
+            }
           } else if (type === "rank") {
             setPhase("ranking");
-            finalRows = (event.rows as RankedRow[]) || [];
+            finalRows = ((event.rows as RankedRow[]) || []).map((row) => {
+              const applicant = row.application_id == null ? undefined : applicantsById.get(row.application_id);
+              return applicant
+                ? {
+                    ...row,
+                    itr_path: applicant.itr_path,
+                    itr_path_p2: applicant.itr_path_p2,
+                  }
+                : row;
+            });
             setRanked(finalRows);
           } else if (type === "error") {
             const message = String(event.message ?? "Pipeline error");
@@ -956,7 +1665,16 @@ export default function MLRankingPage() {
               setOcrAnalytics(finalAnalytics);
             }
             if (!finalRows.length && Array.isArray(event.rankings) && event.rankings.length) {
-              finalRows = event.rankings as RankedRow[];
+              finalRows = (event.rankings as RankedRow[]).map((row) => {
+                const applicant = row.application_id == null ? undefined : applicantsById.get(row.application_id);
+                return applicant
+                  ? {
+                      ...row,
+                      itr_path: applicant.itr_path,
+                      itr_path_p2: applicant.itr_path_p2,
+                    }
+                  : row;
+              });
               setRanked(finalRows);
             }
           }
@@ -1027,19 +1745,48 @@ export default function MLRankingPage() {
       }
       setElapsed(0);
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to run the OCR / ranking pipeline.");
+      localError = err instanceof Error ? err.message : "Failed to run the OCR / ranking pipeline.";
+      setError(localError);
+      pushLog({ msg: `RUN FAILED: ${localError}`, stderr: true });
     } finally {
       // Keep a finished run's log + metrics on screen after the progress modal
       // closes, so the admin has proof of what the training / ranking did.
-      setLastRun({
+      const finished = {
         mode: runMode,
         finishedAt: new Date().toLocaleTimeString("en-PH"),
         logs: logLinesRef.current.slice(),
         trainInfo: finalTrainInfo,
         rankedCount: finalRows.length,
         error: localError,
-      });
+      };
+      setLastRun(finished);
+      // ...and append it to the durable history so earlier runs (and their
+      // logs, holdout metrics and OCR match rates) remain readable.
+      setRunHistory(
+        recordRun({
+          id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          mode: runMode,
+          finishedAt: new Date().toISOString(),
+          label: isTrain && !selectedProgramId
+            ? `Training data \u00b7 ${histFile?.name || "uploaded file"}`
+            : selectedProgramId
+              ? `${programName} \u00b7 OCR + Random Forest ranking`
+              : runMode === "scan"
+                ? "OCR scan (all linked ITRs)"
+                : "AI ranking",
+          seconds: Math.round((Date.now() - startedAt) / 1000),
+          rankedCount: finalRows.length,
+          error: localError,
+          logs: logLinesRef.current.slice(-RUN_HISTORY_LOG_LINES),
+          trainInfo: finalTrainInfo,
+          ocrAnalytics: finalAnalytics,
+        }),
+      );
+      setShowStandaloneLog(runMode === "scan" || Boolean(localError));
       setBusy(null);
+      // Only a run that actually produced rows/analytics is worth persisting;
+      // an aborted or empty run must not wipe the previous good session.
+      if (finalRows.length || finalAnalytics || finalTrainInfo) persistRef.current = true;
     }
   }
 
@@ -1064,6 +1811,14 @@ export default function MLRankingPage() {
       setSavedCount(0);
       setSavedRankings([]);
       setRanked([]);
+      // Drop the mirrored detail too — the ranking it described is gone.
+      clearSession();
+      setDocs([]);
+      setOcrAnalytics(null);
+      setTrainInfo(null);
+      setLogLines([]);
+      logLinesRef.current = [];
+      setLastRun(null);
       setMessage(`Deleted the saved AI ranking (${rows?.length ?? 0} row(s)) from the database.`);
       toast.success("Saved ranking deleted.");
     } catch (err: unknown) {
@@ -1087,6 +1842,7 @@ export default function MLRankingPage() {
       difference: d.match?.diff ?? "",
       confidence: d.confidence ?? "",
       extraction_method: d.method ?? "",
+      labeled_ocr_candidates: JSON.stringify(d.itr_fields ?? []),
       cached: d.cached ? "yes" : "no",
       error: d.error ?? "",
     })));
@@ -1226,6 +1982,7 @@ export default function MLRankingPage() {
       year_level: r.year_level ?? "",
       sex: r.sex ?? "",
       itr_path: r.itr_path ?? "",
+      itr_path_p2: r.itr_path_p2 ?? "",
     })));
     setMessage(`Exported AI ranking CSV (${ranked.length} row(s)).`);
     toast.success(`Exported AI ranking CSV (${ranked.length} row(s)).`);
@@ -1239,6 +1996,10 @@ export default function MLRankingPage() {
     setOcrAnalytics(null);
     setTrainInfo(null);
     setLogLines([]);
+    logLinesRef.current = [];
+    setLastRun(null);
+    // The mirrored session belongs to the previous program's run.
+    clearSession();
     setProgress({ done: 0, total: 0 });
     setExpanded(null);
     setMessage("");
@@ -1307,6 +2068,43 @@ export default function MLRankingPage() {
           <span className="mt-px inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-red-600 text-[9px] font-bold text-white">!</span>
           {error}
         </div>
+      )}
+      {lastRun && (lastRun.mode === "scan" || Boolean(lastRun.error)) && (
+        <section className="overflow-hidden rounded-xl border border-[#7B1113]/20 bg-white shadow-sm">
+          <div className="flex flex-wrap items-center justify-between gap-2 bg-[#FAF7F5] px-4 py-3">
+            <div>
+              <p className="text-xs font-bold text-[#241012]">
+                Latest {lastRun.mode === "scan" ? "OCR scan" : lastRun.mode === "train" ? "training" : "ranking"} run
+                <span className={`ml-2 rounded-full px-2 py-0.5 text-[9px] font-bold uppercase ${
+                  lastRun.error ? "bg-red-100 text-red-700" : "bg-emerald-100 text-emerald-700"
+                }`}>
+                  {lastRun.error ? "failed" : "finished"}
+                </span>
+              </p>
+              <p className="mt-0.5 text-[10px] text-[#6B5458]">
+                {lastRun.finishedAt} &middot; {lastRun.logs.length} captured log lines
+                {lastRun.error ? ` · ${lastRun.error}` : ""}
+              </p>
+            </div>
+            <button
+              onClick={() => setShowStandaloneLog((value) => !value)}
+              className="rounded-lg border border-[#7B1113]/30 px-3 py-1.5 text-[10px] font-bold text-[#7B1113] hover:bg-[#7B1113]/5"
+            >
+              {showStandaloneLog ? "Hide full log" : "Show full log"}
+            </button>
+          </div>
+          {showStandaloneLog && (
+            <div className="max-h-96 overflow-y-auto bg-[#241012] p-3 font-mono text-[10px] leading-relaxed text-[#F3E9EA]">
+              {lastRun.logs.map((line, index) => (
+                <p key={index} className={line.stderr ? "text-[#FF9A9A]" : undefined}>
+                  {line.t != null ? <span className="text-[#8B7376]">[{line.t.toFixed(1)}s] </span> : null}
+                  {line.msg}
+                </p>
+              ))}
+              {lastRun.logs.length === 0 && <p className="text-[#8B7376]">No log lines were captured.</p>}
+            </div>
+          )}
+        </section>
       )}
 
       <div className="overflow-hidden rounded-2xl border border-[#241012]/[0.07] bg-white shadow-sm">
@@ -1417,17 +2215,17 @@ export default function MLRankingPage() {
             <p className="rounded-lg bg-[#FAF7F5]/70 px-3 py-2">
               <b className="text-[#241012]">1. Trained model decides priority</b>
               <br />
-              The Colab-aligned Random Forest predicts priority from the five TOINC-derived income features.
+              The Colab-aligned Random Forest predicts priority from annual family income declared in the application and the trained model&rsquo;s feature set.
             </p>
             <p className="rounded-lg bg-[#FAF7F5]/70 px-3 py-2">
-              <b className="text-[#241012]">2. Declared income is the model input</b>
+              <b className="text-[#241012]">2. OCR checks the ITR independently</b>
               <br />
-              OCR reads the ITR and compares it with the entered annual income; it flags differences but does not replace the input.
+              OCR reads the uploaded ITR page(s) and compares its amount with the declaration; a mismatch is flagged for review and never replaces the model input.
             </p>
             <p className="rounded-lg bg-[#FAF7F5]/70 px-3 py-2">
-              <b className="text-[#241012]">3. OCR is an audit check</b>
+              <b className="text-[#241012]">3. The saved model is reused</b>
               <br />
-              Highest model-predicted priority ranks first; declared income breaks probability ties. OCR match is shown for review.
+              An available deployed Random Forest is loaded instead of retraining; highest predicted priority ranks first, then lower declared income breaks ties.
             </p>
           </div>
           <p className="mt-2 text-[11px] leading-5 text-[#6B5458]">
@@ -1448,11 +2246,17 @@ export default function MLRankingPage() {
               then ranks those applicants using that same freshly-trained model.
               <b className="text-[#241012]"> The separate Execute Training Data button remains available for training-only runs.</b>
               <br />
-              Reads <code className="rounded bg-[#241012]/[0.05] px-1">TOINC</code> (annual family income) &rarr; 5 features,
-              target <code className="rounded bg-[#241012]/[0.05] px-1">NPCINC &le; 4</code>. Both columns and valid values on every row are required for Colab-aligned training.
+              Reads <code className="rounded bg-[#241012]/[0.05] px-1">TOINC</code> (annual family income) &rarr; exactly the <b className="text-[#241012]">5 notebook features</b> (annual income, monthly equivalent, TRAIN tax-exempt &le;&nbsp;250k, CHED ceiling &le;&nbsp;400k, income bracket), target <code className="rounded bg-[#241012]/[0.05] px-1">NPCINC &le; 4</code>. <code className="rounded bg-[#241012]/[0.05] px-1">TOINC</code> and <code className="rounded bg-[#241012]/[0.05] px-1">NPCINC</code> are required on every row for Colab-aligned training. Same code, same columns as <code className="rounded bg-[#241012]/[0.05] px-1">spc_scholarship_ml_training.py</code>.
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
+            <button
+              onClick={() => document.getElementById("run-history")?.scrollIntoView({ behavior: "smooth", block: "start" })}
+              className="rounded-xl border border-[#7B1113]/30 px-3.5 py-2.5 text-xs font-bold text-[#7B1113] transition hover:bg-[#7B1113]/5"
+              title="Jump to the run history: every training / ranking run with its full execution log and analytics"
+            >
+              Run history ({runHistory.length})
+            </button>
             <button
               onClick={() => runPipeline("train")}
               disabled={!!busy || !histFile}
@@ -1512,6 +2316,54 @@ export default function MLRankingPage() {
               No file uploaded &mdash; the bundled sample ({trainInfo?.n_csv ?? 20} rows) is used. The file is optional;
               training still runs without it.
             </span>
+          )}
+          {/* Row report for the upload: pila ka rows + naa ba'ng TOINC/NPCINC
+              kada row. Counts only - the row values themselves never leave
+              the server (backend/ml/rows_report.py). */}
+          {histFile && (
+            <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-[#241012]/[0.07] pt-1.5">
+              <span className="text-[10px] font-extrabold uppercase tracking-wide text-[#7B1113]">Rows in file</span>
+              {rowsBusy ? (
+                <span className="animate-pulse">Counting rows&hellip;</span>
+              ) : rowsError ? (
+                <span className="font-semibold text-red-600">{rowsError}</span>
+              ) : rowsInfo && rowsInfo.rows != null ? (
+                <>
+                  <span>
+                    <b className="text-[#241012]">{rowsInfo.rows.toLocaleString()} rows</b>
+                    {rowsInfo.sheet ? ` in sheet ${rowsInfo.sheet}` : ""} &middot; {rowsInfo.columns ?? "\u2014"} columns
+                  </span>
+                  <span className="rounded-md bg-white px-1.5 py-0.5 ring-1 ring-[#241012]/[0.06]">
+                    TOINC <b className="text-[#241012]">{(rowsInfo.populated?.TOINC ?? 0).toLocaleString()}/{rowsInfo.rows.toLocaleString()}</b>
+                  </span>
+                  <span className="rounded-md bg-white px-1.5 py-0.5 ring-1 ring-[#241012]/[0.06]">
+                    NPCINC <b className="text-[#241012]">{(rowsInfo.populated?.NPCINC ?? 0).toLocaleString()}/{rowsInfo.rows.toLocaleString()}</b>
+                  </span>
+                  {rowsInfo.populated?.FSIZE != null && (
+                    <span className="rounded-md bg-white px-1.5 py-0.5 ring-1 ring-[#241012]/[0.06]">
+                      FSIZE <b className="text-[#241012]">{rowsInfo.populated.FSIZE.toLocaleString()}</b>
+                    </span>
+                  )}
+                  {rowsInfo.populated?.PERCAPITA != null && (
+                    <span className="rounded-md bg-white px-1.5 py-0.5 ring-1 ring-[#241012]/[0.06]">
+                      PERCAPITA <b className="text-[#241012]">{rowsInfo.populated.PERCAPITA.toLocaleString()}</b>
+                    </span>
+                  )}
+                  <span>
+                    train-ready <b className="text-[#241012]">{(rowsInfo.trainable_rows ?? 0).toLocaleString()}</b> row(s)
+                    (TOINC + NPCINC both present)
+                  </span>
+                  {(rowsInfo.warnings || []).map((warning) => (
+                    <span key={warning} className="font-semibold text-amber-700">
+                      {warning}
+                    </span>
+                  ))}
+                  <span className="text-[10px] text-[#8B7376]">
+                    counts only &mdash; no row data is sent to the browser
+                  </span>
+                </>
+              ) : null}
+            </div>
           )}
         </div>
       </div>
@@ -1775,6 +2627,7 @@ export default function MLRankingPage() {
                   <div className="rounded-lg bg-[#FAF7F5] p-2">
                     <p className="text-[9px] font-bold uppercase text-[#8B7376]">Average income alignment</p>
                     <p className="font-extrabold text-[#241012]">{pct(ocrAnalytics.typed_accuracy_pct ?? ocrAnalytics.avg_align_pct)}</p>
+                    <p>OCR compared with declared income</p>
                   </div>
                   <div className="rounded-lg bg-[#FAF7F5] p-2">
                     <p className="text-[9px] font-bold uppercase text-[#8B7376]">Mean OCR confidence</p>
@@ -1854,7 +2707,7 @@ export default function MLRankingPage() {
                   )}
                 </div>
                 <p className="rounded-lg border border-[#241012]/[0.07] px-3 py-2">
-                  <b className="text-[#241012]">Income connection:</b> the student&rsquo;s declared annual family income is the model input. OCR independently reads the ITR and compares the two; OCR does not silently replace the declared value. Per-applicant income and match percentages are shown in the ranking table and OCR audit export.
+                  <b className="text-[#241012]">Income connection:</b> the declared annual family income is the model input. OCR reads the uploaded ITR page(s) only for an independent audit comparison; unreadable or mismatched OCR does not change model scoring.
                 </p>
               </div>
             </section>
@@ -1908,6 +2761,16 @@ export default function MLRankingPage() {
                 Download model
               </a>
               <button
+                onClick={() => {
+                  setHistoryFilter("train");
+                  document.getElementById("run-history")?.scrollIntoView({ behavior: "smooth", block: "start" });
+                }}
+                className="rounded-lg border border-[#7B1113]/30 px-3.5 py-2 text-[11px] font-bold text-[#7B1113] hover:bg-[#7B1113]/5"
+                title="Open the run history filtered to training runs - compare this model's accuracy with every earlier training run"
+              >
+                Run history
+              </button>
+              <button
                 onClick={() => setShowTrainLog((v) => !v)}
                 className="rounded-lg border border-[#7B1113]/30 px-3.5 py-2 text-[11px] font-bold text-[#7B1113] hover:bg-[#7B1113]/5"
               >
@@ -1953,6 +2816,69 @@ export default function MLRankingPage() {
             </div>
           )}
 
+          {/* Second metrics row: the details an admin needs to audit the fit -
+              precision/recall, the confusion matrix, the split, the exact
+              hyperparameters, the label source and the 5 feature columns. */}
+          {lastRun.trainInfo && (
+            <div className="grid grid-cols-2 gap-px border-b border-[#241012]/[0.07] bg-[#241012]/[0.07] sm:grid-cols-4">
+              {[
+                {
+                  label: "Precision / Recall",
+                  value: lastRun.trainInfo.evaluation?.available
+                    ? `${fpct(lastRun.trainInfo.precision, 1)} / ${fpct(lastRun.trainInfo.recall, 1)}`
+                    : "Not evaluated",
+                  title: "Of the rows the model called priority, how many were; and of the truly priority rows, how many it found.",
+                },
+                {
+                  label: "Confusion matrix",
+                  value: lastRun.trainInfo.confusion_matrix?.length
+                    ? lastRun.trainInfo.confusion_matrix.map((row) => `[${row.join(", ")}]`).join(" ")
+                    : "\u2014",
+                  title: "[[true waitlist, false priority], [missed priority, true priority]] on the held-out split",
+                },
+                {
+                  label: "Train / test split",
+                  value: lastRun.trainInfo.evaluation?.available
+                    ? `${lastRun.trainInfo.evaluation.n_train.toLocaleString()} / ${lastRun.trainInfo.evaluation.n_test.toLocaleString()}`
+                    : "\u2014",
+                  title: "Rows used to fit the forest / rows held back to measure it (80/20, seed 42).",
+                },
+                {
+                  label: "Hyperparameters",
+                  value: `${lastRun.trainInfo.n_trees} trees \u00b7 depth ${lastRun.trainInfo.model_params?.max_depth ?? "\u2014"} \u00b7 leaf ${lastRun.trainInfo.model_params?.min_samples_leaf ?? "\u2014"} \u00b7 seed ${lastRun.trainInfo.seed}`,
+                  title: "Random Forest parameters - identical to the Colab notebook.",
+                },
+                {
+                  label: "Rows fitted",
+                  value: `${(lastRun.trainInfo.n_samples ?? 0).toLocaleString()} (file ${(lastRun.trainInfo.n_csv ?? 0).toLocaleString()}, real ${lastRun.trainInfo.n_real ?? 0}, synth ${lastRun.trainInfo.n_synthetic ?? 0})`,
+                  title: "Execute Training Data fits the uploaded file only - no synthetic rows are blended in.",
+                },
+                {
+                  label: "Label source",
+                  value: lastRun.trainInfo.dataset?.label_sources
+                    ? `${lastRun.trainInfo.dataset.label_sources.observed_npcinc.toLocaleString()} observed NPCINC / ${lastRun.trainInfo.dataset.label_sources.derived_proxy.toLocaleString()} proxy`
+                    : lastRun.trainInfo.evaluation?.source || "\u2014",
+                  title: "Observed PSA NPCINC deciles are the only labels presented as real accuracy.",
+                },
+                {
+                  label: "Model artifact",
+                  value: `${lastRun.trainInfo.persisted ? "saved to Storage" : "runtime only"} \u00b7 ${Math.round(lastRun.trainInfo.model_size_kb)} KB \u00b7 fit ${Math.round(lastRun.trainInfo.train_ms)} ms`,
+                  title: lastRun.trainInfo.model_path,
+                },
+                {
+                  label: "Feature columns",
+                  value: (lastRun.trainInfo.feature_columns || []).join(", ") || "\u2014",
+                  title: "The exact columns the forest was fitted on - matches the notebook's feature_cols list.",
+                },
+              ].map((m) => (
+                <div key={m.label} className="bg-white px-5 py-3">
+                  <p className="text-[10px] font-extrabold uppercase tracking-wide text-[#6B5458]" title={m.title}>{m.label}</p>
+                  <p className="mt-0.5 break-words text-[11px] font-bold text-[#241012]" title={m.value}>{m.value}</p>
+                </div>
+              ))}
+            </div>
+          )}
+
           {lastRun.trainInfo && Object.keys(lastRun.trainInfo.feature_importance || {}).length > 0 && (
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-[#241012]/[0.07] px-5 py-2.5 text-[11px] text-[#6B5458]">
               <span
@@ -1988,6 +2914,23 @@ export default function MLRankingPage() {
           )}
         </div>
       )}
+
+      {/* Durable audit trail: every training / ranking / OCR run with its full
+          log and analytics, so past metrics stay readable after a rerun. */}
+      <RunHistoryCard
+        entries={runHistory}
+        filter={historyFilter}
+        onFilter={setHistoryFilter}
+        expandedId={expandedRunId}
+        onExpand={setExpandedRunId}
+        onClear={() => {
+          if (!runHistory.length) return;
+          if (!window.confirm(`Delete the stored run history (${runHistory.length} run(s)) from this browser?`)) return;
+          clearRunHistory();
+          setRunHistory([]);
+          setExpandedRunId(null);
+        }}
+      />
 
       {ranked.length === 0 ? (
         <EmptyState
@@ -2031,12 +2974,22 @@ export default function MLRankingPage() {
                 {" \u00b7 "}
                 <span className="text-[#6B5458]">
                   {ranked.some((row) => row.savedResultOnly)
-                    ? "saved ranking values restored from the database"
-                    : "declared income feeds the model; OCR only checks it against the ITR"}
+                    ? "saved ranking values restored from the database · run AI Ranking to refresh OCR details"
+                    : "declared annual income is the model input; OCR is an independent ITR audit"}
                 </span>
               </p>
             </div>
             <div className="flex flex-wrap gap-2">
+              <button
+                onClick={() => {
+                  setHistoryFilter("rank");
+                  document.getElementById("run-history")?.scrollIntoView({ behavior: "smooth", block: "start" });
+                }}
+                className="rounded-lg border border-[#7B1113]/30 px-3.5 py-2 text-[11px] font-bold text-[#7B1113] hover:bg-[#7B1113]/5"
+                title="Open the run history filtered to OCR + ranking runs - every run's execution log and OCR analytics"
+              >
+                Run history &amp; analytics
+              </button>
               <button
                 onClick={() => setShowRankLog((v) => !v)}
                 className="rounded-lg border border-[#7B1113]/30 px-3.5 py-2 text-[11px] font-bold text-[#7B1113] hover:bg-[#7B1113]/5"
@@ -2164,7 +3117,7 @@ export default function MLRankingPage() {
         </div>
       )}
 
-      {busy && (
+      {busy && progressVisible && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4">
           <div className="flex max-h-[90vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl">
             <div className="border-b border-[#241012]/[0.07] bg-gradient-to-r from-[#FAF7F5] to-white px-5 py-4">
@@ -2182,6 +3135,15 @@ export default function MLRankingPage() {
                     {busy === "train" ? "Fitting the Random Forest (no OCR, no ranking)" : phaseLabel[phase]} &middot; {elapsed}s elapsed
                   </p>
                 </div>
+                <button
+                  type="button"
+                  onClick={() => setProgressVisible(false)}
+                  aria-label="Hide progress window without stopping the run"
+                  title="Hide this window; OCR and ranking will continue"
+                  className="ml-auto rounded-lg border border-[#241012]/15 px-3 py-1.5 text-[10px] font-bold text-[#6B5458] hover:bg-[#FAF7F5]"
+                >
+                  Hide
+                </button>
               </div>
 
               <div className="mt-4 flex items-center">
@@ -2264,7 +3226,11 @@ export default function MLRankingPage() {
                             {d.status === "done" && !d.error ? "\u2713" : d.status === "error" || d.error ? "!" : "\u2022"}
                           </span>
                           <div className="min-w-0">
-                            <p className="truncate text-[11px] font-semibold text-[#241012]">{d.path}</p>
+                            <p className="truncate text-[11px] font-semibold text-[#241012]">
+                              <span className="mr-1 text-[10px] text-[#8B7376]">[{d.index}/{d.total}]</span>
+                              {d.path}
+                              {d.path2 ? ` + ${d.path2}` : ""}
+                            </p>
                             <p className="text-[10px] text-[#8B7376]">
                               {d.student_name || "not linked to an application"}
                               {d.declared_income != null && ` \u00b7 declared ${peso(d.declared_income)}`}
@@ -2281,7 +3247,7 @@ export default function MLRankingPage() {
                             {d.cached ? " \u00b7 served from cache" : ""}
                           </p>
                           <p>
-                            Typed-income accuracy:{" "}
+                            Income alignment vs declared amount:{" "}
                             <b className="text-[#7B1113]">{pct(d.accuracy_pct ?? d.match?.align_pct, 2)}</b>
                             {d.declared_income != null &&
                               ` \u00b7 typed ${peso(d.declared_income)} vs OCR ${peso(d.ocr_value)}`}
@@ -2294,15 +3260,66 @@ export default function MLRankingPage() {
                             <b className="text-[#7B1113]">
                               {d.need_score != null ? d.need_score.toFixed(1) : "\u2014"}
                             </b>
-                            {d.need_score != null &&
-                              ` \u00b7 ${d.income_source?.startsWith("ocr") ? "from ITR income" : "from typed income"}`}
+                            {d.need_score != null && " \u00b7 from declared income (OCR is audit-only)"}
                           </p>
                         </div>
                       ) : (
                         <p className="mt-1.5 text-[10px] text-[#6B5458]">
-                          {d.declared_income != null && `typed ${peso(d.declared_income)}`}
+                          {d.declared_income != null && `declared/model input ${peso(d.declared_income)}`}
                           {d.skipped ? ` \u00b7 ${d.skipped}` : ""}
+                          {!d.skipped && !d.error && " \u00b7 OCR did not find a supported income amount"}
                         </p>
+                      )}
+                      {(d.method || d.attempts || d.preview?.length) && (
+                        <div className="mt-2 border-t border-[#241012]/[0.06] pt-2 text-[10px] text-[#6B5458]">
+                          {!!d.itr_fields?.length && (
+                            <div className="mb-2 rounded-lg border border-[#241012]/[0.06] bg-white p-2">
+                              <p className="mb-1 font-bold text-[#241012]">Labeled ITR OCR candidates</p>
+                              <div className="space-y-1">
+                                {d.itr_fields.map((field) => (
+                                  <p key={`${field.page}-${field.field}`} className="flex flex-wrap justify-between gap-x-3">
+                                    <span>
+                                      Page {field.page} · {field.label}
+                                      {field.kind === "tax" ? " · tax (not income)" : ""}
+                                    </span>
+                                    <b className={field.kind === "income" ? "text-emerald-700" : "text-[#6B5458]"}>
+                                      {typeof field.value === "number" ? peso(field.value) : field.value}
+                                      {` · ${pct(field.confidence * 100, 1)} confidence`}
+                                    </b>
+                                  </p>
+                                ))}
+                              </div>
+                              <p className="mt-1 text-[9px] text-[#8B7376]">
+                                OCR candidates need manual verification. Tax/payment amounts are never income; declared annual family income remains the ranking input.
+                              </p>
+                            </div>
+                          )}
+                          <p>
+                            OCR diagnostics: {d.attempts ?? 0} pass(es), {d.line_count ?? 0} detected line(s),{" "}
+                            {d.ocr_ms ?? 0} ms total
+                            {d.income_page ? ` · income selected from Page ${d.income_page}` : ""}
+                            {d.variant ? ` · ${d.variant}` : ""}
+                            {d.box_thresh != null ? ` · box threshold ${d.box_thresh.toFixed(2)}` : ""}
+                          </p>
+                          {d.method && <p>Extraction rule: {d.method}</p>}
+                          {d.anchor && <p>Income label: {d.anchor}</p>}
+                          {d.amount_line && <p>Matched OCR line: {d.amount_line}</p>}
+                          {d.steps?.length ? <p>Preprocessing: {d.steps.join(" → ")}</p> : null}
+                          {d.preview?.length ? (
+                            <details className="mt-1">
+                              <summary className="cursor-pointer font-semibold text-[#7B1113]">
+                                OCR text preview ({d.preview.length} lines)
+                              </summary>
+                              <div className="mt-1 max-h-36 overflow-y-auto rounded bg-[#FAF7F5] p-2 font-mono">
+                                {d.preview.map((line, index) => (
+                                  <p key={index}>
+                                    {line.score.toFixed(3)} · {line.text}
+                                  </p>
+                                ))}
+                              </div>
+                            </details>
+                          ) : null}
+                        </div>
                       )}
                     </div>
                   ))}
@@ -2324,6 +3341,24 @@ export default function MLRankingPage() {
               </div>
             </div>
           </div>
+        </div>
+      )}
+      {busy && !progressVisible && (
+        <div className="fixed bottom-4 right-4 z-50 flex items-center gap-3 rounded-xl border border-[#7B1113]/20 bg-white px-4 py-3 shadow-xl">
+          <span className="h-3 w-3 animate-pulse rounded-full bg-[#7B1113]" />
+          <div>
+            <p className="text-[11px] font-bold text-[#241012]">Run continues in background</p>
+            <p className="text-[10px] text-[#6B5458]">
+              {phaseLabel[phase]}{progress.total ? ` · ${progress.done}/${progress.total} documents` : ""}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setProgressVisible(true)}
+            className="rounded-lg bg-[#7B1113] px-3 py-1.5 text-[10px] font-bold text-white hover:bg-[#540111]"
+          >
+            Show details
+          </button>
         </div>
       )}
     </div>
@@ -2416,27 +3451,27 @@ function RankRow({
         ? "bg-[#FEF3C7] text-[#92400E] ring-1 ring-[#D97706]/30"
         : "bg-[#D1FAE5] text-[#065F46] ring-1 ring-[#059669]/30";
   const trust: "verified" | "mismatch" | "unverified" | "no_itr" | "not_saved" =
-    row.savedResultOnly ? "not_saved" : row.itr_trust ?? (row.itr_path ? "mismatch" : "no_itr");
+    row.savedResultOnly ? "not_saved" : row.itr_trust ?? (row.itr_path || row.itr_path_p2 ? "mismatch" : "no_itr");
   const matchChip =
     trust === "not_saved"
       ? { cls: "bg-gray-100 text-gray-600 ring-gray-300/50", dot: "bg-gray-400", text: "Details not saved", title: "The ranking row persisted, but OCR details are not part of the current ranking_result table" }
       : trust === "verified"
-      ? { cls: "bg-[#D1FAE5] text-[#065F46] ring-[#059669]/30", dot: "bg-emerald-500", text: `${pct(row.ocr_match_pct, 1)} \u2713`, title: "Typed income matches the scanned ITR; the trained model ranks applicants" }
+      ? { cls: "bg-[#D1FAE5] text-[#065F46] ring-[#059669]/30", dot: "bg-emerald-500", text: `${pct(row.ocr_match_pct, 1)} \u2713`, title: "OCR income matches declared income; OCR is an audit comparison and declared income remains the model input" }
       : trust === "mismatch"
-        ? { cls: "bg-[#FEF3C7] text-[#92400E] ring-[#D97706]/30", dot: "bg-amber-500", text: `${pct(row.ocr_match_pct, 1)} \u2717`, title: "Typed income differs from the ITR; OCR is an audit warning and does not change model input" }
+        ? { cls: "bg-[#FEF3C7] text-[#92400E] ring-[#D97706]/30", dot: "bg-amber-500", text: `${pct(row.ocr_match_pct, 1)} \u2717`, title: "OCR income differs from declared income; declared income remains the model input and the mismatch is flagged for review" }
         : trust === "unverified"
-          ? { cls: "bg-gray-100 text-gray-600 ring-gray-300/50", dot: "bg-gray-400", text: "OCR unavailable", title: "An ITR was uploaded, but OCR could not read an income amount. Review the document; no match percentage is available." }
-          : { cls: "bg-gray-100 text-gray-600 ring-gray-300/50", dot: "bg-gray-400", text: "No ITR", title: "No ITR uploaded; declared annual income is used when available" };
+          ? { cls: "bg-gray-100 text-gray-600 ring-gray-300/50", dot: "bg-gray-400", text: "OCR unavailable", title: "An ITR was uploaded, but OCR could not read an income amount. Declared income remains the model input." }
+          : { cls: "bg-gray-100 text-gray-600 ring-gray-300/50", dot: "bg-gray-400", text: "No ITR", title: "No ITR uploaded; declared annual income is the model input when available" };
   const trustNote =
     trust === "not_saved"
       ? "OCR comparison was not stored with this ranking result"
       : trust === "verified"
-      ? `Typed income matches the ITR (${pct(row.ocr_match_pct, 1)})`
+      ? `Declared income matches the ITR (${pct(row.ocr_match_pct, 1)}); OCR is audit-only`
       : trust === "mismatch"
-        ? `Typed income differs from the ITR (${pct(row.ocr_match_pct, 1)}); declared income remains the model input`
+        ? `OCR income differs from declared income (${pct(row.ocr_match_pct, 1)}); declared income remains the model input`
         : trust === "unverified"
-          ? "ITR uploaded, but OCR did not find an income amount to compare"
-          : "No ITR uploaded; declared income is used when available";
+          ? "ITR uploaded, but OCR did not find income; declared income remains the model input"
+          : "No ITR uploaded; declared income is the model input when available";
   return (
     <>
       <tr
@@ -2471,7 +3506,9 @@ function RankRow({
               ? "details not saved"
               : row.declared_income == null
                 ? "not declared"
-                : "student input · model income"}
+                : row.ocr_income != null
+                  ? "declared model input · compared with OCR"
+                  : "declared model input"}
           </div>
         </td>
         <td className="whitespace-nowrap px-4 py-3" title={row.ocr_error || undefined}>
@@ -2485,7 +3522,7 @@ function RankRow({
                 ? "amount read from ITR"
                 : row.ocr_scan_failed && row.ocr_error
                   ? `scan failed: ${row.ocr_error}`
-                  : row.itr_path
+                  : row.itr_path || row.itr_path_p2
                     ? "income not detected"
                     : "no ITR uploaded"}
           </div>
@@ -2501,7 +3538,7 @@ function RankRow({
         </td>
         <td className="px-4 py-3">
           {row.financial_need_score == null
-            ? <span className="text-[#8B7376]">\u2014</span>
+            ? <span className="text-[#8B7376]">{"\u2014"}</span>
             : <ScoreMeter value={row.financial_need_score} tone="need" />}
         </td>
         <td className="px-4 py-3">
@@ -2513,16 +3550,25 @@ function RankRow({
           </span>
         </td>
         <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
-          {row.itr_path ? (
-            <button
-              onClick={() => onViewItr(row.itr_path!)}
-              className="inline-flex whitespace-nowrap items-center gap-1 rounded-lg border border-[#7B1113]/25 px-2.5 py-1.5 text-[10px] font-bold text-[#7B1113] transition hover:bg-[#7B1113]/10"
-            >
-              View ITR
-            </button>
-          ) : (
-            <span className="text-[#8B7376]">None</span>
-          )}
+          <div className="flex flex-col items-start gap-1">
+            {row.itr_path && (
+              <button
+                onClick={() => onViewItr(row.itr_path!)}
+                className="inline-flex whitespace-nowrap items-center gap-1 rounded-lg border border-[#7B1113]/25 px-2.5 py-1.5 text-[10px] font-bold text-[#7B1113] transition hover:bg-[#7B1113]/10"
+              >
+                View ITR 1
+              </button>
+            )}
+            {row.itr_path_p2 && (
+              <button
+                onClick={() => onViewItr(row.itr_path_p2!)}
+                className="inline-flex whitespace-nowrap items-center gap-1 rounded-lg border border-[#7B1113]/25 px-2.5 py-1.5 text-[10px] font-bold text-[#7B1113] transition hover:bg-[#7B1113]/10"
+              >
+                View ITR 2
+              </button>
+            )}
+            {!row.itr_path && !row.itr_path_p2 && <span className="text-[#8B7376]">None</span>}
+          </div>
         </td>
       </tr>
       {expanded && (
@@ -2539,7 +3585,7 @@ function RankRow({
                 </p>
                 {row.ocr_income_differs && row.income_delta != null && (
                   <p className="mt-1 rounded-lg bg-amber-50 px-2 py-1 text-amber-700">
-                    OCR differs by {row.income_delta > 0 ? "+" : ""}{peso(row.income_delta)} &mdash; shown for review; declared income remains the model input.
+                    OCR differs by {row.income_delta > 0 ? "+" : ""}{peso(row.income_delta)} &mdash; declared income remains the model input; review this ITR mismatch.
                   </p>
                 )}
                 <p className="flex justify-between gap-2 py-0.5">
@@ -2556,7 +3602,7 @@ function RankRow({
                   <b className="text-[#7B1113]">Model priority probability</b>
                 </p>
                 <p className="flex justify-between gap-2 py-0.5">Financial need score <b>{row.financial_need_score?.toFixed(1) ?? "\u2014"}</b></p>
-                <p className="flex justify-between gap-2 py-0.5">OCR match (audit only) <b>{row.ocr_status === "not_comparable" ? "\u2014" : row.ocr_match_pct?.toFixed(2) ?? "\u2014"}</b></p>
+                <p className="flex justify-between gap-2 py-0.5">OCR audit vs declared income <b>{row.ocr_status === "not_comparable" ? "\u2014" : row.ocr_match_pct?.toFixed(2) ?? "\u2014"}</b></p>
                 <p className="flex justify-between gap-2 py-0.5">Priority score (predicted) <b className="text-[#7B1113]">{row.priority_score.toFixed(2)}</b></p>
                 {row.probability != null && (
                   <p className="flex justify-between gap-2 py-0.5">P(high need) <b>{(row.probability * 100).toFixed(1)}%</b></p>
@@ -2568,7 +3614,10 @@ function RankRow({
                 <p className="flex justify-between gap-2 py-0.5">Year level <b>{row.year_level || "\u2014"}</b></p>
                 <p className="flex justify-between gap-2 py-0.5">Sex <b>{row.sex || "\u2014"}</b></p>
                 <p className="mt-1 break-all rounded-lg bg-[#FAF7F5] px-2 py-1 text-[10px] text-[#6B5458]">
-                  {row.itr_path || "No ITR uploaded yet"}
+                  {row.itr_path ? `ITR 1: ${row.itr_path}` : ""}
+                  {row.itr_path && row.itr_path_p2 ? "\n" : ""}
+                  {row.itr_path_p2 ? `ITR 2: ${row.itr_path_p2}` : ""}
+                  {!row.itr_path && !row.itr_path_p2 ? "No ITR uploaded yet" : ""}
                 </p>
               </div>
             </div>
