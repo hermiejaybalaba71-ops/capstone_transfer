@@ -1,4 +1,5 @@
 import sys
+import math
 import tempfile
 import unittest
 from io import BytesIO
@@ -17,10 +18,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import joblib
 
-from ml import features
-from ml.csv_data import _resolve, row_from
-from ml.ocr_engine import extract_income, match_declared
-from ml.pipeline import analytics_from, build_docs
+from ml import features, pipeline
+from ml.csv_data import _resolve, load_training_csv, row_from
+from ml.ocr_engine import (
+    _layout_anchor,
+    extract_1701_ms_compensation_income,
+    extract_1701_ms_fields,
+    extract_1701_ms_layout_fields,
+    extract_income,
+    match_declared,
+    pick_priority_value,
+)
+from ml import form_layout
+from ml.pipeline import analytics_from, build_docs, index_by_application
+from ml.pipeline import _cache_id as pipeline_cache_id
 from ml.rank_model import load_external, predict, train
 from ml.service import MAX_SHEET_BYTES, _parse_sheet, _stream_pipeline, health
 
@@ -29,6 +40,30 @@ class OcrIncomeExtractionTests(unittest.TestCase):
     @staticmethod
     def line(text, y=100, x=100):
         return {"text": text, "score": 0.96, "y": y, "x": x, "h": 20}
+
+    def test_extracts_income_from_1701_ms_digit_boxes_when_full_page_text_misses_digits(self):
+        image = np.full((1924, 1224, 3), 255, dtype=np.uint8)
+        for x in (669, 698, 727, 787, 816, 846):
+            image[282:294, x : x + 7] = 0
+        lines = [
+            self.line("1701-MS 08/24 P2", y=136),
+            self.line("1 Gross Compensation Income", y=288),
+        ]
+        seen = []
+
+        def recognize(crops):
+            seen.append(len(crops))
+            return [
+                (text, 0.9)
+                for text in ("1", "8", "o", "5", "o", "o")
+            ], 0.01
+
+        extracted = extract_1701_ms_compensation_income(image, lines, recognize)
+
+        self.assertIsNotNone(extracted)
+        self.assertEqual(extracted["value"], 180_500)
+        self.assertEqual(extracted["method"], "1701_ms_compensation_digit_boxes")
+        self.assertEqual(seen, [6])
 
     def test_extracts_plain_integer_annual_income(self):
         extracted = extract_income([self.line("Total annual income 132000")])
@@ -52,6 +87,76 @@ class OcrIncomeExtractionTests(unittest.TestCase):
 
         self.assertIsNotNone(extracted)
         self.assertEqual(extracted["value"], 132_000)
+
+    def test_extracts_labeled_1701_ms_income_and_tax_fields_separately(self):
+        page1 = [
+            self.line("1701-MS 08/24 P1", y=10),
+            self.line("11 Source of Income Income from Business Compensation Income", y=100),
+            self.line("23 Total Income Tax Due", y=500),
+            self.line("7,580", y=500, x=700),
+            self.line("29 Total Amount Payable/(Overpayment)", y=800),
+            self.line("13,200", y=800, x=700),
+        ]
+        page2 = [
+            self.line("1701-MS 08/24 P2", y=10),
+            self.line("1 Gross Compensation Income", y=200),
+            self.line("180500", y=200, x=700),
+            self.line("3 Taxable Compensation Income", y=240),
+            self.line("158800", y=240, x=700),
+        ]
+
+        page1_fields = extract_1701_ms_fields(page1, page_no=1)
+        page2_fields = extract_1701_ms_fields(page2, page_no=2)
+
+        self.assertEqual(
+            [(field["field"], field["kind"], field["value"]) for field in page1_fields],
+            [
+                ("income_source_options", "source", "11 Source of Income Income from Business Compensation Income"),
+                ("total_income_tax_due", "tax", 7_580),
+                ("total_amount_payable", "tax", 13_200),
+            ],
+        )
+        self.assertEqual(
+            [(field["field"], field["kind"], field["value"]) for field in page2_fields],
+            [
+                ("gross_compensation_income", "income", 180_500),
+                ("taxable_compensation_income", "income", 158_800),
+            ],
+        )
+
+    def test_gross_income_from_operations_matches_the_printed_parentheses_label(self):
+        # BIR 1701-MS Page 2 prints "Gross Income/(Loss) from Operation" - the
+        # literal parentheses must not break the Item 9 anchor (priority 2 on
+        # Page 2), or the extraction silently falls through to priority 3.
+        page2 = [
+            self.line("1701-MS 08/24 P2", y=10),
+            self.line("9 Gross Income/(Loss) from Operation (Item 7 Less Item 8)", y=300),
+            self.line("281,500", y=300, x=700),
+            self.line("15 Total Taxable Income - Compensation & Business", y=400),
+            self.line("376,950", y=400, x=700),
+        ]
+
+        fields = extract_1701_ms_fields(page2, page_no=2)
+
+        self.assertEqual(
+            [(field["field"], field["value"]) for field in fields],
+            [("gross_business_income", 281_500), ("total_taxable_income", 376_950)],
+        )
+        pick = pick_priority_value(fields, page_no=2)
+        self.assertEqual(pick["rank"], 2)
+        self.assertEqual(pick["value"], 281_500)
+
+    def test_1701_ms_field_extraction_does_not_read_tax_table_amounts_as_income(self):
+        fields = extract_1701_ms_fields(
+            [
+                self.line("1701-MS 08/24 P2", y=10),
+                self.line("If Taxable Income is: Over P 800,000 but not over P 2,000,000", y=900),
+                self.line("P 102,500 + 25% of excess over P 800,000", y=920),
+            ],
+            page_no=2,
+        )
+
+        self.assertEqual(fields, [])
 
     def test_supports_annual_family_income_label_order_variation(self):
         extracted = extract_income([self.line("Total annual family income 132000")])
@@ -78,6 +183,35 @@ class OcrIncomeExtractionTests(unittest.TestCase):
 
         self.assertEqual(match["align_pct"], 90.91)
         self.assertEqual(match["status"], "mismatch")
+
+    def test_total_income_tax_due_row_is_never_taken_as_the_income_figure(self):
+        # Page 1 of the BIR 1701-MS prints "23 Total Income Tax Due (Sum of
+        # Items 21 and 22) 7,580". The "total income" keyword must not grab
+        # that tax figure - it would stop Page 2 (the real income row) from
+        # ever being scanned.
+        extracted = extract_income(
+            [
+                self.line("23 Total Income Tax Due (Sum of Items 21 and 22)"),
+                self.line("7,580", x=700),
+                self.line("Gross Compensation Income"),
+                self.line("300,500", x=700, y=140),
+            ]
+        )
+
+        self.assertIsNotNone(extracted)
+        self.assertEqual(extracted["value"], 300_500)
+        self.assertIn("compensation income", extracted["method"])
+
+    def test_tax_due_anchor_is_skipped_even_as_a_total_pattern_match(self):
+        extracted = extract_income(
+            [
+                self.line("Total Income Tax Due 45,000"),
+                self.line("Tax Payable 12,500"),
+            ],
+            allow_fallback=False,
+        )
+
+        self.assertIsNone(extracted)
 
     def test_render_ml_service_is_separate_from_vercel_frontend(self):
         repository_root = Path(__file__).resolve().parents[2]
@@ -198,6 +332,175 @@ class OcrIncomeExtractionTests(unittest.TestCase):
         self.assertIsNone(analytics["avg_confidence"])
 
 
+class LayoutCellReaderTests(unittest.TestCase):
+    """Per-row digit reading from the official 1701-MS layout boxes.
+
+    Synthetic pages place black "printed digit" bars inside the exact
+    amount-cell boxes of the BIR PDF layout (form_layout), the way a filled
+    form does; the recognizer is stubbed so only the geometry, filtering and
+    parsing logic is under test here (real recognition is covered by the
+    sample-image validation runs).
+    """
+
+    @staticmethod
+    def line(text, y, x=30, h=21):
+        return {"text": text, "score": 0.96, "y": y, "x": x, "h": h}
+
+    @staticmethod
+    def blank_page():
+        return np.full((1924, 1224, 3), 255, dtype=np.uint8)
+
+    @staticmethod
+    def draw_digits(image, x0, y0, specs):
+        """specs: (rel_x, width, rel_y, height) bars inside the cell box."""
+        for rx, rw, ry, rh in specs:
+            image[y0 + ry : y0 + ry + rh, x0 + rx : x0 + rx + rw] = 0
+
+    @staticmethod
+    def recognizer(*answers):
+        queue = list(answers)
+
+        def recognize(_crops):
+            return [(queue.pop(0), 0.9)], 0.01
+
+        return recognize
+
+    P1_LINES = [
+        line.__func__("1701-MS 08/24 P1", y=10, h=10),
+        line.__func__("23 Total Income Tax Due (Sum of Items 21 and 22)", y=983),
+        line.__func__("25 Tax Payable/(Overpayment) (Item 23 Less Item 24)", y=1037),
+        line.__func__(
+            "29 Total Amount Payable/(Overpayment) (Sum of Items 27 and 28D)",
+            y=1231,
+        ),
+    ]
+    # item 23 cell px origin (657, 968); item 29 cell px origin (654, 1215)
+    ITEM23_DIGITS = [(12, 7, 9, 11), (40, 7, 9, 11), (99, 7, 9, 11),
+                     (128, 7, 9, 11), (157, 7, 9, 11)]
+    ITEM29_DIGITS = [(11, 7, 8, 11), (70, 7, 8, 11), (100, 7, 8, 11),
+                     (130, 7, 8, 11)]
+
+    def test_reads_priority_rows_from_the_official_amount_boxes(self):
+        image = self.blank_page()
+        # item 23 = 19,000, item 29 = 8,800, item 25 cell left empty
+        self.draw_digits(image, 657, 968, self.ITEM23_DIGITS)
+        self.draw_digits(image, 654, 1215, self.ITEM29_DIGITS)
+
+        fields = extract_1701_ms_layout_fields(
+            image, self.P1_LINES, 1, self.recognizer("19000", "8800")
+        )
+
+        by_field = {field["field"]: field for field in fields}
+        self.assertEqual(
+            set(by_field), {"total_income_tax_due", "total_amount_payable"}
+        )
+        self.assertEqual(by_field["total_income_tax_due"]["value"], 19_000)
+        self.assertEqual(
+            by_field["total_income_tax_due"]["method"], "1701_ms_layout_cell"
+        )
+        self.assertEqual(by_field["total_amount_payable"]["value"], 8_800)
+        self.assertEqual(
+            by_field["total_income_tax_due"]["anchor"],
+            "23 Total Income Tax Due (Sum of Items 21 and 22)",
+        )
+
+        pick = pick_priority_value(fields, page_no=1)
+        self.assertEqual(pick["rank"], 1)
+        self.assertEqual(pick["value"], 19_000)
+
+    def test_empty_cell_falls_through_to_the_next_priority_row(self):
+        image = self.blank_page()
+        self.draw_digits(image, 654, 1215, self.ITEM29_DIGITS)
+
+        fields = extract_1701_ms_layout_fields(
+            image, self.P1_LINES, 1, self.recognizer("8800")
+        )
+
+        pick = pick_priority_value(fields, page_no=1)
+        self.assertEqual(pick["rank"], 3)
+        self.assertEqual(pick["value"], 8_800)
+
+    def test_not_cleared_when_no_priority_cell_carries_a_value(self):
+        image = self.blank_page()
+
+        fields = extract_1701_ms_layout_fields(
+            image, self.P1_LINES, 1, self.recognizer()
+        )
+
+        self.assertEqual(fields, [])
+        self.assertIsNone(pick_priority_value(fields, page_no=1))
+
+    def test_non_digit_recognizer_output_is_rejected_not_guessed(self):
+        image = self.blank_page()
+        self.draw_digits(image, 657, 968, self.ITEM23_DIGITS)
+
+        fields = extract_1701_ms_layout_fields(
+            image, self.P1_LINES, 1, self.recognizer("8..8.0.0")
+        )
+
+        self.assertEqual(fields, [])
+        self.assertIsNone(pick_priority_value(fields, page_no=1))
+
+    def test_low_confidence_strip_is_rejected(self):
+        image = self.blank_page()
+        self.draw_digits(image, 657, 968, self.ITEM23_DIGITS)
+
+        def recognize(_crops):
+            return [("19000", 0.05)], 0.01
+
+        fields = extract_1701_ms_layout_fields(image, self.P1_LINES, 1, recognize)
+
+        self.assertEqual(fields, [])
+
+    def test_section_header_is_never_used_as_the_item_25_anchor(self):
+        pattern = form_layout.FIELD_LAYOUT[1]["tax_payable_overpayment"][5]
+        lines = [
+            self.line("PART II - Total Income Tax Payable (DO NOT enter Centavos)", y=830),
+            self.line("25 Tax Payable/(Overpayment) (Item 23 Less Item 24)", y=1037),
+        ]
+
+        anchor = _layout_anchor(lines, pattern, 1224)
+
+        self.assertIsNotNone(anchor)
+        self.assertIn("25 Tax Payable", anchor["text"])
+
+    def test_reader_requires_the_1701_ms_header(self):
+        image = self.blank_page()
+        self.draw_digits(image, 657, 968, self.ITEM23_DIGITS)
+        lines = [line for line in self.P1_LINES if "1701" not in line["text"]]
+
+        fields = extract_1701_ms_layout_fields(
+            image, lines, 1, self.recognizer()
+        )
+
+        self.assertEqual(fields, [])
+
+    def test_page_two_gross_compensation_cell(self):
+        image = self.blank_page()
+        # item 1 cell px origin (657, 271) with the -4 px anchor shift
+        self.draw_digits(
+            image,
+            657,
+            271,
+            [(12, 7, 11, 12), (40, 8, 11, 12), (70, 8, 11, 12),
+             (130, 7, 11, 12), (159, 8, 11, 12), (189, 7, 11, 12)],
+        )
+        lines = [
+            self.line("1701-MS 08/24 P2", y=10, h=10),
+            self.line("1 Gross Compensation Income", y=288, x=33, h=24),
+        ]
+
+        fields = extract_1701_ms_layout_fields(
+            image, lines, 2, self.recognizer("146500")
+        )
+
+        self.assertEqual(len(fields), 1)
+        self.assertEqual(fields[0]["field"], "gross_compensation_income")
+        self.assertEqual(fields[0]["value"], 146_500)
+        pick = pick_priority_value(fields, page_no=2)
+        self.assertEqual((pick["rank"], pick["value"]), (1, 146_500))
+
+
 class ForestStub:
     feature_importances_ = [0.7, 0.3]
     n_estimators = 200
@@ -219,7 +522,31 @@ class FixedProbabilityClassifier:
 
 
 class RankingAnalyticsTests(unittest.TestCase):
-    def test_ocr_income_is_audit_only_and_declared_income_builds_colab_features(self):
+    def test_grades_are_not_model_features_or_priority_target_inputs(self):
+        self.assertNotIn("academic_norm", features.FEATURE_COLUMNS)
+        row = features.build_row(
+            {
+                "application_id": 1,
+                "declared_income": 120_000,
+                "shs_gwa": 99,
+                "college_gpa": 4.0,
+            },
+            None,
+        )
+        self.assertNotIn("academic_norm", row)
+        self.assertEqual(
+            features.priority_target({"financial_need_score": 50, "academic_norm": 0.0}),
+            features.priority_target({"financial_need_score": 50, "academic_norm": 1.0}),
+        )
+
+    def test_saved_grade_based_model_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "grades are no longer permitted"):
+            predict(
+                [{"application_id": 1}],
+                {"feature_columns": ["academic_norm"], "medians": {}},
+            )
+
+    def test_ocr_income_is_audit_only_and_does_not_change_declared_income_model_features(self):
         applicant = {
             "application_id": 1,
             "declared_income": 120_000,
@@ -240,7 +567,7 @@ class RankingAnalyticsTests(unittest.TestCase):
         )
 
         self.assertEqual(row["income_used"], 120_000)
-        self.assertEqual(row["income_source"], "declared")
+        self.assertEqual(row["income_source"], "declared_ocr_audit")
         self.assertEqual(row["annual_income_family"], 120_000)
         self.assertEqual(row["monthly_income_equiv"], 10_000)
         self.assertEqual(row["is_train_tax_exempt"], 1.0)
@@ -255,7 +582,96 @@ class RankingAnalyticsTests(unittest.TestCase):
             [alternate_ocr_row],
             columns=features.NOTEBOOK_FEATURE_COLUMNS,
         )
-        np.testing.assert_array_equal(model_input, alternate_model_input)
+        self.assertTrue(np.array_equal(model_input, alternate_model_input))
+        full_model_input, _ = features.matrix([row], columns=features.FEATURE_COLUMNS)
+        alternate_full_model_input, _ = features.matrix(
+            [alternate_ocr_row],
+            columns=features.FEATURE_COLUMNS,
+        )
+        self.assertTrue(np.array_equal(full_model_input, alternate_full_model_input))
+
+    def test_any_ocr_confidence_uses_declared_income_for_ranking(self):
+        row = features.build_row(
+            {"application_id": 1, "declared_income": 120_000, "itr_path": "applicant/itr.png"},
+            {
+                "ocr_value": 300_000,
+                "low_confidence": True,
+                "match": {"align_pct": 40.0, "exact_match": False, "status": "mismatch"},
+            },
+        )
+
+        self.assertEqual(row["income_used"], 120_000)
+        self.assertEqual(row["income_source"], "declared_ocr_audit")
+        self.assertEqual(row["annual_income_family"], 120_000)
+
+    def test_ocr_does_not_replace_missing_declared_income(self):
+        row_with_ocr = features.build_row(
+            {"application_id": 1, "declared_income": None, "itr_path": "applicant/itr.png"},
+            {"ocr_value": 300_000},
+        )
+        row_without_ocr = features.build_row(
+            {"application_id": 1, "declared_income": None, "itr_path": "applicant/itr.png"},
+            None,
+        )
+
+        self.assertIsNone(row_with_ocr["income_used"])
+        self.assertEqual(row_with_ocr["income_source"], "none")
+        with_ocr, _ = features.matrix([row_with_ocr], columns=features.FEATURE_COLUMNS)
+        without_ocr, _ = features.matrix([row_without_ocr], columns=features.FEATURE_COLUMNS)
+        self.assertTrue(np.array_equal(with_ocr, without_ocr))
+
+    def test_tax_bracket_and_explanatory_note_amounts_are_not_income(self):
+        lines = [
+            {"text": "If Taxable Income is:", "score": 0.96, "y": 100, "x": 100, "h": 20},
+            {"text": "800,000", "score": 0.96, "y": 125, "x": 100, "h": 20},
+            {"text": "but not over P 2,000,000", "score": 0.96, "y": 145, "x": 100, "h": 20},
+            {"text": "IfTaxableIncomeis:", "score": 0.96, "y": 200, "x": 100, "h": 20},
+            {"text": "800.000", "score": 0.96, "y": 225, "x": 100, "h": 20},
+            {"text": "21 Total Income (Sum of Items 19 and 20)", "score": 0.96, "y": 500, "x": 100, "h": 20},
+            {
+                "text": "and/or professionals in the amount of P250.000 "
+                "(not applicable if with compensation income)",
+                "score": 0.96,
+                "y": 530,
+                "x": 100,
+                "h": 20,
+            },
+            {"text": "I1011 Compensation Income", "score": 0.96, "y": 600, "x": 100, "h": 20},
+            {
+                "text": "TABLE 2-Tax Rates (effective January 1, 2023 and onwards)",
+                "score": 0.96,
+                "y": 625,
+                "x": 100,
+                "h": 20,
+            },
+            {"text": "I1016 Mixed Income8% IT Rate", "score": 0.96, "y": 650, "x": 100, "h": 20},
+            {
+                "text": "P 2,202,500 + 35% of the excess over P 8,000,000",
+                "score": 0.96,
+                "y": 675,
+                "x": 100,
+                "h": 20,
+            },
+            {"text": "Not over P 250,000", "score": 0.96, "y": 700, "x": 100, "h": 20},
+        ]
+
+        extracted = extract_income(lines, allow_fallback=True)
+
+        self.assertIsNone(extracted)
+
+    def test_build_row_keeps_both_itr_paths_for_ranking_results(self):
+        row = features.build_row(
+            {
+                "application_id": 1,
+                "declared_income": 120_000,
+                "itr_path": "student/itr-page-1.png",
+                "itr_path_p2": "student/itr-page-2.png",
+            },
+            {"ocr_value": 120_000, "match": {"align_pct": 100, "status": "match"}},
+        )
+
+        self.assertEqual(row["itr_path"], "student/itr-page-1.png")
+        self.assertEqual(row["itr_path_p2"], "student/itr-page-2.png")
 
     def test_unreadable_itr_is_not_reported_as_a_zero_percent_mismatch(self):
         row = features.build_row(
@@ -347,6 +763,79 @@ class RankingAnalyticsTests(unittest.TestCase):
         self.assertEqual(row["priority_target"], 100.0)
         self.assertEqual(row["itr_income_bracket"], 1.0)
 
+    def test_notebook_feature_columns_match_the_five_column_notebook(self):
+        # The panel's Colab notebook trains on exactly these five income
+        # columns, in this order - nothing else may leak into the train-only
+        # feature matrix or the app and the notebook would disagree.
+        self.assertEqual(
+            features.NOTEBOOK_FEATURE_COLUMNS,
+            [
+                "annual_income_family",
+                "monthly_income_equiv",
+                "is_train_tax_exempt",
+                "is_ched_priority_ceiling",
+                "itr_income_bracket",
+            ],
+        )
+        # household size / per-capita are still carried on the rows (used by
+        # other scoring paths), just not as notebook training features.
+        for column in ("family_size", "per_capita_income"):
+            self.assertIn(column, features.FEATURE_COLUMNS)
+
+    def test_training_file_rows_carry_household_size(self):
+        resolved = _resolve({"toinc": "TOINC", "npcinc": "NPCINC", "fsize": "FSIZE"})
+
+        row = row_from(
+            {"TOINC": "240000", "NPCINC": "3", "FSIZE": "6"},
+            resolved,
+            income_ranked=True,
+        )
+
+        self.assertEqual(row["family_size"], 6.0)
+        self.assertEqual(row["per_capita_income"], 40_000.0)
+
+    def test_family_size_validation_and_neutral_default(self):
+        resolved = _resolve({"toinc": "TOINC", "fsize": "FSIZE"})
+
+        missing = row_from({"TOINC": "240000"}, resolved)
+        invalid = row_from({"TOINC": "240000", "FSIZE": "0"}, resolved)
+
+        self.assertTrue(math.isnan(missing["family_size"]))
+        # income / neutral household size (4), not the dataset median per-capita
+        self.assertEqual(missing["per_capita_income"], 60_000.0)
+        self.assertTrue(math.isnan(invalid["family_size"]))
+
+        declared = features.build_row({"declared_income": 240_000, "family_size": 6}, None)
+        self.assertEqual(declared["family_size"], 6.0)
+        self.assertEqual(declared["per_capita_income"], 40_000.0)
+
+        no_answer = features.build_row({"declared_income": 240_000}, None)
+        self.assertTrue(math.isnan(no_answer["family_size"]))
+        self.assertEqual(no_answer["per_capita_income"], 60_000.0)
+
+        self.assertEqual(features.family_size("5"), 5.0)
+        self.assertTrue(math.isnan(features.family_size("five")))
+        self.assertTrue(math.isnan(features.family_size(25)))
+
+    def test_training_loader_drops_exact_duplicate_rows(self):
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["TOINC", "FSIZE", "NPCINC"])
+        for _ in range(3):
+            sheet.append([240_000, 5, 3])
+        sheet.append([300_000, 2, 6])
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "training.xlsx"
+            workbook.save(path)
+            rows, warnings = load_training_csv(path, income_ranked=True)
+
+        # 2 unique households kept, the 2 repeated copies dropped
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(any("duplicate row(s) removed" in w for w in warnings))
+        self.assertTrue(any("Income range check" in w for w in warnings))
+        self.assertTrue(any("Family size present on 2 of 2" in w for w in warnings))
+
     def test_build_docs_only_includes_selected_applicant_itr_files(self):
         applicants = [
             {
@@ -367,6 +856,154 @@ class RankingAnalyticsTests(unittest.TestCase):
         self.assertEqual(len(docs), 9)
         self.assertTrue(all(doc["linked"] for doc in docs))
         self.assertEqual({doc["application_id"] for doc in docs}, set(range(1, 10)))
+
+    def test_build_docs_attaches_the_second_itr_page_and_its_storage_meta(self):
+        applicants = [
+            {
+                "itr_path": "student/1.png",
+                "itr_path_p2": "student/1_p2.png",
+                "application_id": 1,
+                "declared_income": 100_000,
+            },
+            {"itr_path": "student/2.png", "application_id": 2, "declared_income": 90_000},
+            {
+                "itr_path_p2": "student/3_p2.png",
+                "application_id": 3,
+                "declared_income": 80_000,
+            },
+        ]
+        bucket_files = [
+            {"path": "student/1.png", "size": 50_000, "updated_at": "t1"},
+            {"path": "student/1_p2.png", "size": 60_000, "updated_at": "t2"},
+            {"path": "student/2.png", "size": 40_000, "updated_at": "t3"},
+            {"path": "student/3_p2.png", "size": 30_000, "updated_at": "t4"},
+        ]
+
+        with patch("ml.pipeline.storage.list_all", return_value=bucket_files):
+            docs = build_docs(applicants)
+
+        with_two_pages = next(doc for doc in docs if doc["application_id"] == 1)
+        without = next(doc for doc in docs if doc["application_id"] == 2)
+        self.assertEqual(with_two_pages["path2"], "student/1_p2.png")
+        self.assertEqual(with_two_pages["size2"], 60_000)
+        self.assertEqual(with_two_pages["updated_at2"], "t2")
+        self.assertNotIn("path2", without)
+        page2_only = next(doc for doc in docs if doc["application_id"] == 3)
+        self.assertEqual(page2_only["path"], "student/3_p2.png")
+        self.assertEqual(page2_only["page_no"], 2)
+
+        # The cache key must change when EITHER page changes, otherwise a
+        # re-uploaded Page 2 would silently reuse Page 1's stale OCR result.
+        key_before = pipeline_cache_id(with_two_pages)
+        changed = dict(with_two_pages, updated_at2="t9")
+        self.assertNotEqual(key_before, pipeline_cache_id(changed))
+        single = pipeline_cache_id(without)
+        self.assertEqual(single[0], "student/2.png")
+
+    def test_shared_itr_path_keeps_ocr_results_for_each_bulk_application(self):
+        applicants = [
+            {
+                "itr_path": "student/shared.png",
+                "application_id": application_id,
+                "declared_income": income,
+            }
+            for application_id, income in ((10, 100_000), (11, 120_000))
+        ]
+        with patch("ml.pipeline.storage.list_all", return_value=[
+            {"path": "student/shared.png", "size": 20_000, "updated_at": "t1"},
+        ]):
+            docs = build_docs(applicants)
+
+        def fake_scan(doc):
+            return {
+                "path": doc["path"],
+                "path2": None,
+                "application_id": doc["application_id"],
+                "student_name": None,
+                "declared_income": doc["declared_income"],
+                "linked": True,
+                "ocr_value": 90_000,
+                "match": {
+                    "exact_match": False,
+                    "align_pct": 90.0,
+                    "diff": 10_000,
+                    "status": "mismatch",
+                },
+                "confidence": 0.9,
+                "ocr_ms": 1.0,
+                "line_count": 1,
+                "error": None,
+                "cached": False,
+                "need_score": None,
+                "low_confidence": False,
+                "scan_failure": False,
+                "skipped": None,
+            }
+
+        with (
+            patch("ml.pipeline.ocr_cache.get", return_value=None),
+            patch("ml.pipeline.ocr_cache.put"),
+            patch("ml.pipeline._scan_one", side_effect=fake_scan),
+        ):
+            results, _analytics = pipeline.scan_documents(docs)
+
+        linked = index_by_application(results)
+        self.assertEqual(set(linked), {10, 11})
+        self.assertEqual(linked[10]["declared_income"], 100_000)
+        self.assertEqual(linked[11]["declared_income"], 120_000)
+
+    def test_scan_retries_cache_created_with_fewer_ocr_variants(self):
+        doc = {
+            "path": "student/itr.png",
+            "size": 20_000,
+            "updated_at": "t1",
+            "application_id": 1,
+            "student_name": "Test applicant",
+            "declared_income": 300_500,
+            "linked": True,
+        }
+        scanned_record = {
+            "path": doc["path"],
+            "application_id": doc["application_id"],
+            "student_name": doc["student_name"],
+            "declared_income": doc["declared_income"],
+            "linked": True,
+            "ocr_value": 300_500,
+            "match": {
+                "exact_match": True,
+                "align_pct": 100.0,
+                "diff": 0.0,
+                "status": "match",
+            },
+            "confidence": 0.99,
+            "ocr_ms": 1.0,
+            "line_count": 1,
+            "error": None,
+            "cached": False,
+            "need_score": None,
+            "low_confidence": False,
+            "scan_failure": False,
+            "skipped": None,
+            "ocr_max_variants": 3,
+        }
+
+        with (
+            patch("ml.pipeline.cfg.OCR_MAX_VARIANTS", 3),
+            patch(
+                "ml.pipeline.ocr_cache.get",
+                return_value={"ocr_value": None, "ocr_max_variants": 0},
+            ),
+            patch("ml.pipeline.ocr_cache.put") as cache_put,
+            patch("ml.pipeline._scan_one", return_value=scanned_record) as scan,
+            patch("ml.pipeline.emit"),
+            patch("ml.pipeline.log"),
+            patch("ml.pipeline.analytics_from", return_value={}),
+        ):
+            results, _analytics = pipeline.scan_documents([doc])
+
+        scan.assert_called_once_with(doc)
+        cache_put.assert_called_once()
+        self.assertEqual(results["app-1"]["ocr_value"], 300_500)
 
     def test_external_model_restores_saved_training_analytics(self):
         analytics = {
@@ -410,6 +1047,58 @@ class RankingAnalyticsTests(unittest.TestCase):
         self.assertEqual(model["dataset"], analytics["dataset"])
         self.assertEqual(model["evaluation"], analytics["evaluation"])
         self.assertEqual(model["feature_importance"], analytics["feature_importance"])
+
+    def test_external_model_download_creates_nested_cache_directory(self):
+        payload = {
+            "regressor": ForestStub(),
+            "feature_columns": ["annual_income_family", "year_level"],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.joblib"
+            runtime_model_dir = Path(directory) / "runtime"
+            joblib.dump(payload, source)
+
+            with (
+                patch("ml.rank_model._config.MODEL_DIR", runtime_model_dir),
+                patch("ml.rank_model._config.external_model_path", return_value=None),
+                patch("ml.storage.download", return_value=source.read_bytes()),
+            ):
+                model = load_external()
+
+            cached = runtime_model_dir / "models" / "scholarship_rf_model.joblib"
+            self.assertTrue(cached.is_file())
+            self.assertIsNotNone(model)
+            self.assertTrue(model["persisted"])
+
+    def test_external_model_download_surfaces_storage_errors_other_than_not_found(self):
+        from ml.storage import StorageError
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch("ml.rank_model._config.MODEL_DIR", Path(directory)),
+                patch("ml.rank_model._config.external_model_path", return_value=None),
+                patch(
+                    "ml.storage.download",
+                    side_effect=StorageError("download failed: HTTP 503", 503),
+                ),
+            ):
+                with self.assertRaises(StorageError):
+                    load_external()
+
+    def test_external_model_missing_from_storage_allows_local_training_fallback(self):
+        from ml.storage import StorageError
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch("ml.rank_model._config.MODEL_DIR", Path(directory)),
+                patch("ml.rank_model._config.external_model_path", return_value=None),
+                patch(
+                    "ml.storage.download",
+                    side_effect=StorageError("signed URL failed: HTTP 404", 404),
+                ),
+            ):
+                self.assertIsNone(load_external())
 
     def test_external_model_hides_legacy_proxy_metrics_without_label_provenance(self):
         payload = {
@@ -585,6 +1274,7 @@ class RankingAnalyticsTests(unittest.TestCase):
                 "annual_income_family": 120_000,
                 "has_itr": 1,
                 "itr_path": "student/itr.png",
+                "itr_path_p2": "student/itr_p2.png",
                 "ocr_income": None,
                 "ocr_match_pct": 0.0,
                 "ocr_status": "not_comparable",
@@ -595,6 +1285,8 @@ class RankingAnalyticsTests(unittest.TestCase):
 
         self.assertIsNone(ranked[0]["ocr_match_pct"])
         self.assertEqual(ranked[0]["itr_trust"], "unverified")
+        self.assertEqual(ranked[0]["itr_path"], "student/itr.png")
+        self.assertEqual(ranked[0]["itr_path_p2"], "student/itr_p2.png")
 
     def test_colab_training_requires_observed_npcinc_labels(self):
         rows = [

@@ -37,10 +37,11 @@ failure instead of claiming that no income was found.
 - `config.py` - `.env.local` loader, priority weights, income limits, stack versions.
 - `preproc.py` - image decode / enhancement / candidate variants.
 - `ocr_engine.py` - RapidOCR wrapper: DirectML execution provider, extraction
-  from common BIR family-income, compensation-income, and taxable-income labels
-  (including comma-grouped and plain integer amounts), plus declared-vs-OCR
-  percentage comparison. OCR extraction is best-effort across different form
-  layouts; an unreadable amount is shown as unavailable rather than a 0% match.
+  from common BIR family-income and compensation-income labels, plus separately
+  labeled 1701-MS income and tax/payment candidates. The annual compensation
+  figure is kept distinct from taxable income and tax due; tax/payment amounts
+  are never substitutes for income. OCR extraction is best-effort and requires
+  manual verification before treating a candidate as ground truth.
 - `cache.py` - OCR result cache keyed by `path|size|updated_at` (skips unchanged files).
 - `features.py` - the model feature set, financial-need score, priority target.
 - `rank_model.py` - synthetic training rows, RandomForest fit, metrics, joblib dump.
@@ -78,6 +79,23 @@ annual family income is mapped to the `TOINC` feature and breaks probability
 ties, lowest declared income first. OCR reads the ITR as a separate audit check:
 the detected amount and match percentage are displayed, but OCR does not
 replace model input or affect the model probability.
+
+The PSA FIES PUF's `TOINC` is total annual family income; `FSIZE` supplies
+household size and the `NPCINC <= 4` label is based on per-capita income. The
+monthly feature is calculated as `TOINC / 12`; it is not read as a separate
+monthly value from the annual 1701-MS return. A tax return reports the filer's
+income, which may not equal the whole household income. The 1701-MS Page 2
+income candidates (including Gross Compensation Income, taxable compensation,
+and business-income fields) are therefore shown with their labels and kept
+separate. Page 1 tax due, payable, and payment values are classified as tax
+fields, never as income. The current RapidOCR model is pretrained: these
+form-specific extraction rules and regression tests do not fine-tune its
+recognizer. Genuine OCR training/evaluation needs varied images with manually
+verified field labels.
+
+Academic grades (SHS GWA and college GPA) are not ranking inputs. New locally
+trained models omit the academic feature, and older saved models that include
+grade features are rejected until retrained.
 
 The dataset summary and model analytics are stored inside the deployed model
 artifact in Supabase Storage. Accuracy, precision, recall, F1, and ROC-AUC are

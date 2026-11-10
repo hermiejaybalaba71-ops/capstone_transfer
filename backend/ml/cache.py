@@ -14,7 +14,7 @@ from typing import Dict, Optional
 from . import config as _config
 
 CACHE_PATH = _config.MODEL_DIR / "ocr_cache.json"
-VERSION = 5
+VERSION = 9
 
 
 def _key(path: str, size, updated_at) -> str:

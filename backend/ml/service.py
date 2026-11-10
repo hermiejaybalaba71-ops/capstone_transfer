@@ -161,6 +161,12 @@ def health() -> JSONResponse:
     )
 
 
+@app.get("/health", include_in_schema=False)
+def health_alias() -> JSONResponse:
+    """/health alias for `/` - local and deployed health checks probe it."""
+    return health()
+
+
 def _parse_sheet(filename: str, contents: bytes) -> dict:
     safe_name = filename.replace("\\", "/").rsplit("/", 1)[-1]
     suffix = Path(safe_name).suffix.lower()
@@ -212,6 +218,47 @@ async def parse_sheet(request: Request) -> JSONResponse:
         raise HTTPException(status_code=400, detail="Missing x-file-name header.")
     contents = await request.body()
     return JSONResponse(await asyncio.to_thread(_parse_sheet, filename, contents))
+
+
+@app.get("/training-rows")
+def training_rows() -> JSONResponse:
+    """Row report for the uploaded training file - counts only, no row values.
+
+    Lets the "Machine learning train data" panel say how many rows the file
+    has (and whether TOINC / NPCINC are on every one of them) without the
+    panel ever seeing a single household record.
+    """
+    python_bin, runtime_env = _runtime_python()
+    try:
+        result = subprocess.run(
+            [python_bin, str(ML_DIR / "rows_report.py")],
+            cwd=str(ML_DIR),
+            env=runtime_env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=180,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(status_code=504, detail="Reading the training file took too long.") from exc
+
+    line = next(
+        (raw for raw in reversed((result.stdout or "").splitlines()) if raw.strip().startswith("{")),
+        "",
+    )
+    if not line:
+        errors = (result.stderr or "").strip().splitlines()
+        raise HTTPException(
+            status_code=500,
+            detail=errors[-1] if errors else "The row report returned no output.",
+        )
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail="The row report returned invalid JSON.") from exc
+    return JSONResponse(payload)
 
 
 @app.post("/pipeline")

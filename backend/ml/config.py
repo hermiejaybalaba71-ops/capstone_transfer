@@ -128,7 +128,10 @@ MODEL_STORAGE_BUCKET = "training-data"
 MODEL_STORAGE_PATH = "models/scholarship_rf_model.joblib"
 
 # --- OCR limits -----------------------------------------------------------
-OCR_MAX_VARIANTS = 3           # preprocessing candidates tried before giving up
+# Alternate preprocessing retries are expensive on CPU-only machines. The
+# original image is always scanned; set OCR_MAX_VARIANTS=3 to enable every
+# preprocessing retry for difficult or low-quality scans.
+OCR_MAX_VARIANTS = max(0, min(3, int(os.environ.get("OCR_MAX_VARIANTS", "0"))))
 OCR_LINE_PREVIEW = 8           # OCR lines returned per document for the UI
 OCR_MIN_CONFIDENCE = 0.30
 

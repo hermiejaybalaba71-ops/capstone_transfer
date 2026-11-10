@@ -12,7 +12,9 @@ from . import config as _config
 
 
 class StorageError(RuntimeError):
-    pass
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def _headers(key: str, content_json: bool = False) -> Dict[str, str]:
@@ -39,7 +41,7 @@ def list_all(bucket: str, prefix: str = "") -> List[Dict]:
         with urllib.request.urlopen(request, timeout=60) as response:
             entries = json.loads(response.read().decode() or "[]")
     except urllib.error.HTTPError as exc:
-        raise StorageError(f"list failed for '{prefix}': HTTP {exc.code}") from exc
+        raise StorageError(f"list failed for '{prefix}': HTTP {exc.code}", exc.code) from exc
 
     files: List[Dict] = []
     for entry in entries:
@@ -75,7 +77,7 @@ def download(bucket: str, path: str) -> bytes:
         with urllib.request.urlopen(request, timeout=60) as response:
             signed = json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
-        raise StorageError(f"signed URL failed for '{path}': HTTP {exc.code}") from exc
+        raise StorageError(f"signed URL failed for '{path}': HTTP {exc.code}", exc.code) from exc
 
     signed_path = signed.get("signedURL") or signed.get("signedUrl")
     if not signed_path:
@@ -89,7 +91,7 @@ def download(bucket: str, path: str) -> bytes:
         ) as response:
             return response.read()
     except urllib.error.HTTPError as exc:
-        raise StorageError(f"download failed for '{path}': HTTP {exc.code}") from exc
+        raise StorageError(f"download failed for '{path}': HTTP {exc.code}", exc.code) from exc
 
 
 def upload(bucket: str, path: str, data: bytes, content_type: str = "application/octet-stream") -> None:
@@ -112,7 +114,7 @@ def upload(bucket: str, path: str, data: bytes, content_type: str = "application
         with urllib.request.urlopen(request, timeout=120):
             return
     except urllib.error.HTTPError as exc:
-        raise StorageError(f"upload failed for '{path}': HTTP {exc.code}") from exc
+        raise StorageError(f"upload failed for '{path}': HTTP {exc.code}", exc.code) from exc
 
 
 def owner_hint(path: Optional[str]) -> Optional[str]:

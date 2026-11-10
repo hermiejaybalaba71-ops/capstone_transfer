@@ -1,8 +1,9 @@
 """Random Forest ranking model (scikit-learn + joblib).
 
-For Colab-aligned training, one classifier is trained on the five PSA FIES
-income features and `NPCINC <= 4`; its priority probability drives applicant
-ordering. The general local-training path fits a classifier and regressor:
+For Colab-aligned training, one classifier is trained on the seven PSA FIES
+income/household features and `NPCINC <= 4`; its priority probability drives
+applicant ordering. The general local-training path fits a classifier and
+regressor:
 
 * ``RandomForestClassifier`` -> High Need / Low Need + probability
   (accuracy / precision / recall / F1 / ROC-AUC for the analytics panel)
@@ -14,6 +15,7 @@ with joblib for later applicant scoring.
 
 from __future__ import annotations
 
+import json
 import math
 import time
 import uuid
@@ -41,6 +43,8 @@ def _synthetic_rows(n: int, seed: int) -> List[Dict]:
     rows: List[Dict] = []
     for _ in range(n):
         income = float(np.exp(rng.uniform(np.log(40_000.0), np.log(600_000.0))))
+        # Household size drawn at the FIES distribution (mean 4.07 persons).
+        size = float(np.clip(rng.normal(4.07, 1.7), 1.0, 19.5))
         ocr_roll = rng.random()
         if ocr_roll < 0.72:
             ocr_pct = float(rng.uniform(96.0, 100.0))
@@ -60,7 +64,6 @@ def _synthetic_rows(n: int, seed: int) -> List[Dict]:
             "ocr_verified": 1.0 if ocr_pct > 0 else 0.0,
             "year_level_num": float(rng.integers(1, 6)),
             "sex_code": float(rng.integers(0, 2)),
-            "academic_norm": float(np.clip(rng.normal(0.75, 0.12), 0.2, 1.0)),
             "pwd_flag": 1.0 if rng.random() < 0.017 else 0.0,
             "ip_flag": 1.0 if rng.random() < 0.158 else 0.0,
             "solo_parent_flag": 1.0 if rng.random() < 0.257 else 0.0,
@@ -74,6 +77,8 @@ def _synthetic_rows(n: int, seed: int) -> List[Dict]:
             "is_train_tax_exempt": _features.is_train_tax_exempt(income),
             "is_ched_priority_ceiling": _features.is_ched_priority_ceiling(income),
             "itr_income_bracket": _features.itr_income_bracket(income),
+            "family_size": size,
+            "per_capita_income": _features.per_capita_income(income, size),
         }
         row["priority_target"] = _features.priority_target(row)
         rows.append(row)
@@ -180,6 +185,61 @@ def _dataset_analytics(synth: List[Dict], csv_rows: List[Dict], real_rows: List[
     return out
 
 
+def _write_model_meta_sidecar(payload: Dict, model_path: Path) -> Optional[Path]:
+    """Write a plain-JSON twin of a saved model for the web analytics panel.
+
+    ``joblib.dump`` output can only be read by Python + scikit-learn, which the
+    Next.js route cannot do. Mirroring the metadata (model id, holdout metrics,
+    feature importance, dataset proof, weights) into ``<name>.meta.json`` lets
+    ``GET /api/ml/model-info`` report what the deployed model actually is -
+    including after a stream drops mid-run and the panel loses its events.
+    Returns the sidecar path, or None when it could not be written.
+    """
+    try:
+        analytics = payload.get("analytics") or {}
+        evaluation = analytics.get("evaluation") or {}
+        sidecar = model_path.with_suffix(".meta.json")
+        sidecar.write_text(
+            json.dumps(
+                {
+                    "model_id": payload.get("model_id"),
+                    "created_at": payload.get("created_at"),
+                    "source": payload.get("source"),
+                    "persisted": bool(payload.get("persisted")),
+                    "n_samples": payload.get("n_samples"),
+                    "n_csv": payload.get("n_csv"),
+                    "n_real": payload.get("n_real"),
+                    "n_synthetic": payload.get("n_synthetic"),
+                    "n_trees": payload.get("n_trees"),
+                    "seed": payload.get("seed"),
+                    "sklearn_version": payload.get("sklearn_version"),
+                    "model_params": payload.get("model_params"),
+                    "feature_columns": payload.get("feature_columns"),
+                    "medians": payload.get("medians"),
+                    "weights": payload.get("weights"),
+                    "evaluation": evaluation,
+                    "accuracy": analytics.get("accuracy"),
+                    "precision": analytics.get("precision"),
+                    "recall": analytics.get("recall"),
+                    "f1": analytics.get("f1"),
+                    "roc_auc": analytics.get("roc_auc"),
+                    "confusion_matrix": analytics.get("confusion_matrix"),
+                    "feature_importance": analytics.get("feature_importance"),
+                    "dataset": analytics.get("dataset"),
+                    "train_ms": analytics.get("train_ms"),
+                    "model_size_kb": round(model_path.stat().st_size / 1024.0, 1),
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        return sidecar
+    except Exception:
+        # The sidecar is a display convenience - never fail a training run.
+        return None
+
+
 def train(
     real_rows: List[Dict],
     seed: int = _config.DEFAULT_SEED,
@@ -194,7 +254,7 @@ def train(
     """Train and persist the ranking model, then return its analytics.
 
     ``columns`` pins the feature matrix to an explicit list - the train-only
-    run passes the Colab notebook's five TOINC-derived columns so its
+    run passes the Colab notebook's seven TOINC/FSIZE-derived columns so its
     classifier matches the notebook's model.
     """
     from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
@@ -326,9 +386,9 @@ def train(
     }
 
     # The exact feature order this forest was fit on. The train-only run pins
-    # it to the notebook's five TOINC columns; everything else keeps the full
-    # 20-column list. Recording anything else makes predict() feed the forest
-    # the wrong matrix ("X has 20 features ... expecting 5").
+    # it to the notebook's seven TOINC/FSIZE columns; everything else keeps the
+    # full FEATURE_COLUMNS list. Recording anything else makes predict() feed
+    # the forest the wrong matrix ("X has 20 features ... expecting 7").
     used_columns = list(columns) if columns else list(_features.FEATURE_COLUMNS)
 
     importance_model = reg or clf
@@ -356,11 +416,15 @@ def train(
     _config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
     model_path = _config.MODEL_DIR / f"rf_ranking_seed{seed}.joblib"
     model_id = uuid.uuid4().hex
+    # Which upload produced this forest. A later ranking run compares this to
+    # the file currently in Storage and reuses the model when they match.
+    training_file = _csv_data.uploaded_file_identity() if income_ranked else None
     payload = {
         "classifier": clf,
         "regressor": reg,
         "feature_columns": list(used_columns),
         "model_id": model_id,
+        "training_file": training_file,
         "model_params": {
             "max_depth": max_depth,
             "min_samples_leaf": min_samples_leaf,
@@ -417,6 +481,12 @@ def train(
             # The local artifact remains usable for this invocation; surface
             # persistence failure in analytics instead of hiding it.
             csv_warnings.append(f"Trained model could not be persisted to Storage: {exc}")
+        # Mirror every displayable field into a plain JSON sidecar next to the
+        # joblib. The Next.js panel cannot unpickle a joblib (that needs Python
+        # + scikit-learn), so /api/ml/model-info reads this file instead - it is
+        # how the analytics panel keeps showing real metrics even when the
+        # NDJSON stream is interrupted mid-run.
+        _write_model_meta_sidecar(payload, deployed_path)
 
     return {
         "classifier": clf,
@@ -492,6 +562,17 @@ def _columns_for(model, payload: Dict) -> List[str]:
     )
 
 
+def _reject_grade_features(columns: List[str]) -> None:
+    grade_columns = {"academic_norm", "shs_gwa", "college_gpa", "gwa", "gpa"}
+    included = [column for column in columns if column.strip().lower() in grade_columns]
+    if included:
+        raise ValueError(
+            "The saved ranking model uses grade feature(s) "
+            f"{', '.join(included)}. Retrain it before ranking; grades are no longer "
+            "permitted as ranking inputs."
+        )
+
+
 def load_external(path=None, required: bool = False) -> Optional[Dict]:
     """Load a model trained outside this process (Google Colab export).
 
@@ -506,21 +587,22 @@ def load_external(path=None, required: bool = False) -> Optional[Dict]:
         path = _config.external_model_path(required=required)
     downloaded_from_storage = False
     if path is None:
-        try:
-            from . import storage as _storage
+        from . import storage as _storage
 
-            _config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
-            cached = _config.MODEL_DIR / _config.MODEL_STORAGE_PATH
-            cached.write_bytes(
-                _storage.download(
-                    _config.MODEL_STORAGE_BUCKET,
-                    _config.MODEL_STORAGE_PATH,
-                )
+        cached = _config.MODEL_DIR / _config.MODEL_STORAGE_PATH
+        try:
+            model_bytes = _storage.download(
+                _config.MODEL_STORAGE_BUCKET,
+                _config.MODEL_STORAGE_PATH,
             )
+        except _storage.StorageError as exc:
+            if exc.status_code != 404:
+                raise
+        else:
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            cached.write_bytes(model_bytes)
             path = cached
             downloaded_from_storage = True
-        except Exception:
-            path = None
     if path is None:
         return None
     model_path = Path(path)
@@ -562,6 +644,7 @@ def load_external(path=None, required: bool = False) -> Optional[Dict]:
 
     probe = reg or clf
     columns = _columns_for(probe, meta)
+    _reject_grade_features(columns)
     medians = dict(meta.get("medians") or {})
     for col in columns:
         medians.setdefault(col, 0.0)
@@ -616,6 +699,10 @@ def load_external(path=None, required: bool = False) -> Optional[Dict]:
         "model_params": info["model_params"],
         "external": True,
         "external_info": info,
+        # The upload this forest was fitted on (None for older/Colab exports).
+        # pipeline.py compares it with the file currently in Storage to decide
+        # whether reusing the saved model is safe or a refit is required.
+        "training_file": meta.get("training_file"),
         "n_samples": int(meta.get("n_samples") or 0),
         "n_real": int(meta.get("n_real") or 0),
         "n_synthetic": int(meta.get("n_synthetic") or 0),
@@ -641,12 +728,13 @@ def load_external(path=None, required: bool = False) -> Optional[Dict]:
 
 
 def _income_for_tiebreak(item: Dict) -> float:
-    """Return declared annual income for deterministic model-probability ties.
+    """Return declared model income for deterministic probability ties.
 
-    ``income_used`` is the declared amount mapped to TOINC for this model.
+    ``income_used`` is declared annual income; OCR values are retained only for
+    the separate ITR audit and never decide the tie.
     Rows without a usable declared amount sort last within a probability tie.
     """
-    for key in ("income_used", "declared_income", "annual_income_family", "ocr_income"):
+    for key in ("income_used", "declared_income", "annual_income_family"):
         value = item.get(key)
         if value is not None:
             try:
@@ -666,6 +754,7 @@ def predict(rows: List[Dict], trained: Dict) -> List[Dict]:
     # current FEATURE_COLUMNS - a forest exported from Google Colab may have
     # been trained on a shorter/older feature list.
     columns = [str(c) for c in (trained.get("feature_columns") or _features.FEATURE_COLUMNS)]
+    _reject_grade_features(columns)
     X, _ = _features.matrix(rows, trained["medians"], columns=columns)
 
     reg = trained.get("regressor")
@@ -727,6 +816,7 @@ def predict(rows: List[Dict], trained: Dict) -> List[Dict]:
                     "ocr_status",
                     "financial_need_score",
                     "itr_path",
+                    "itr_path_p2",
                     "priority_target",
                     "pwd_flag",
                     "ip_flag",
@@ -749,7 +839,7 @@ def predict(rows: List[Dict], trained: Dict) -> List[Dict]:
         )
 
     # The trained model's predicted prioritized-class probability is the
-    # ranking basis. Declared income breaks probability ties; OCR is audit-only.
+    # ranking basis. Income used by the model breaks probability ties.
     ranked.sort(
         key=lambda item: (
             -item["probability"],

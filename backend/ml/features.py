@@ -16,13 +16,10 @@ from . import config as _config
 
 FEATURE_COLUMNS: List[str] = [
     "financial_need_score",   # 0-100, higher = poorer
-    "ocr_match_pct",          # 0-100, OCR figure vs typed figure
     "income_log",             # log1p(income) scaled to 0-1
     "has_itr",                # 1 when an ITR document exists
-    "ocr_verified",           # 1 when OCR actually read an income value
     "year_level_num",         # 1..5
     "sex_code",               # 0 male / 1 female / 2 unknown
-    "academic_norm",          # GPA/4 or GWA/100, 0-1 (NaN when missing)
     # --- statutory priority flags (from the preprocessed historical data) ---
     "pwd_flag",               # 1 = person with disability (RA 7277)
     "ip_flag",                # 1 = indigenous peoples member (RA 8371)
@@ -37,11 +34,19 @@ FEATURE_COLUMNS: List[str] = [
     "is_train_tax_exempt",        # 1 when income <= 250,000 (BIR TRAIN Law)
     "is_ched_priority_ceiling",   # 1 when income <= 400,000 (CHED ceiling)
     "itr_income_bracket",         # 1..7 income band from the FIES brackets
+    "family_size",               # household members (FIES FSIZE), NaN when unknown
+    "per_capita_income",         # annual_income_family / family_size
 ]
 
 # The Colab notebook's training set, in its exact order. The train-only
-# "Execute ranking" run fits on these five TOINC-derived columns and nothing
-# else, so a file trained here and a file trained in Colab see identical X.
+# "Execute Training Data" run fits on these columns and nothing else, so a
+# file trained here and a file trained in Colab see identical X.
+#
+# EXACTLY the five columns of the panel's notebook (spc_scholarship_ml_
+# training): income-derived features only. The label (NPCINC <= 4) is a
+# per-capita income decile, so a model on these five columns tops out near
+# ~74% accuracy; that trade-off is accepted so the notebook and the app stay
+# literally identical code.
 NOTEBOOK_FEATURE_COLUMNS: List[str] = [
     "annual_income_family",
     "monthly_income_equiv",
@@ -50,7 +55,12 @@ NOTEBOOK_FEATURE_COLUMNS: List[str] = [
     "itr_income_bracket",
 ]
 
-AVERAGE_ACADEMIC = 0.70
+# Neutral household size (PSA FIES mean = 4.07 persons). Used ONLY when an
+# applicant did not answer the Family Size field, so their per-capita income
+# still follows their declared income (income / 4) instead of collapsing to
+# the dataset's median per-capita income - which would make every applicant
+# who skipped the field look equally poor.
+DEFAULT_FAMILY_SIZE = 4.0
 
 # Text in a priority field that does NOT mean the flag applies. Blanks, "N/A",
 # religion and ethnolinguistic (non-IP) answers collected during cleaning.
@@ -220,6 +230,44 @@ def itr_income_bracket(income: Optional[float]) -> float:
     return 7.0
 
 
+FAMILY_SIZE_MIN = 1.0
+FAMILY_SIZE_MAX = 20.0   # FIES FSIZE tops out at 19.5 persons
+
+
+def family_size(value) -> float:
+    """Household size in persons -> 1.0..20.0. NaN when unknown/invalid.
+
+    The FIES PUF carries FSIZE (mean 4.07, no missing values). An applicant
+    who does not answer is left as NaN and gets the trained model's stored
+    median at scoring time instead of a made-up household size.
+    """
+    if value is None or str(value).strip() == "":
+        return float("nan")
+    text = str(value).strip().replace(",", "")
+    try:
+        size = float(text)
+    except (TypeError, ValueError):
+        return float("nan")
+    if not (FAMILY_SIZE_MIN <= size <= FAMILY_SIZE_MAX):
+        return float("nan")
+    return float(size)
+
+
+def per_capita_income(income: Optional[float], size: Optional[float]) -> float:
+    """Annual family income / household members. NaN when either is unknown."""
+    if income is None:
+        return float("nan")
+    if size is None:
+        return float("nan")
+    try:
+        members = float(size)
+    except (TypeError, ValueError):
+        return float("nan")
+    if math.isnan(members) or members <= 0:
+        return float("nan")
+    return round(float(income) / members, 2)
+
+
 def itr_trust(row: Dict) -> str:
     """ITR comparison status for analytics: verified, mismatch, unreadable, or absent.
 
@@ -264,9 +312,6 @@ def priority_target(row: Dict) -> float:
     """
     need = row.get("financial_need_score", 0.0)
     ocr = row.get("ocr_match_pct", 0.0)
-    academic = row.get("academic_norm", AVERAGE_ACADEMIC)
-    if academic is None or (isinstance(academic, float) and math.isnan(academic)):
-        academic = AVERAGE_ACADEMIC
     bonus, _parts = priority_flags(row)
     # Two ranking bases running side by side:
     #  * rows from the UPLOADED HISTORICAL FILE -> dataset score
@@ -284,7 +329,6 @@ def priority_target(row: Dict) -> float:
             * (
                 _config.W_NEED * (need / 100.0)
                 + _config.W_OCR * (ocr / 100.0)
-                + _config.W_ACADEMIC * academic
             )
             + bonus,
             0.0,
@@ -299,18 +343,7 @@ def effective_income(
     ocr_value: Optional[float],
     low_confidence: bool = False,
 ) -> Tuple[Optional[float], str]:
-    """Choose an income for OCR-only document analytics.
-
-    This helper is used by per-document OCR analytics. Applicant ranking
-    features are built separately from the declared amount so OCR remains an
-    audit comparison and cannot override the Colab model input.
-    """
-    ocr = None
-    if ocr_value is not None:
-        try:
-            ocr = float(ocr_value)
-        except (TypeError, ValueError):
-            ocr = None
+    """Use declared income for ranking; OCR is only an audit comparison."""
     typed = None
     if declared is not None:
         try:
@@ -318,21 +351,21 @@ def effective_income(
         except (TypeError, ValueError):
             typed = None
 
-    if ocr is not None and not low_confidence:
-        return ocr, "ocr"
     if typed is not None:
-        return typed, "declared" if ocr is None else "declared_low_confidence_ocr"
-    if ocr is not None:
-        return ocr, "ocr_low_confidence"
+        return typed, "declared" if ocr_value is None else "declared_ocr_audit"
     return None, "none"
 
 
 def build_row(applicant: Dict, ocr_result: Optional[Dict]) -> Dict:
-    """Build model features from declared income and retain OCR as audit data."""
+    """Build model features from declared income and retain OCR only for audit."""
     declared = applicant.get("declared_income")
     ocr_value = (ocr_result or {}).get("ocr_value")
     match = (ocr_result or {}).get("match") or {}
-    income_used, income_source = effective_income(declared, None)
+    income_used, income_source = effective_income(
+        declared,
+        ocr_value,
+        bool((ocr_result or {}).get("low_confidence")),
+    )
     delta = None
     if declared is not None and ocr_value is not None:
         try:
@@ -340,8 +373,12 @@ def build_row(applicant: Dict, ocr_result: Optional[Dict]) -> Dict:
         except (TypeError, ValueError):
             delta = None
 
-    gpa = _num(applicant.get("college_gpa"))
-    gwa = _num(applicant.get("shs_gwa"))
+    household = family_size(applicant.get("family_size"))
+    per_capita = per_capita_income(income_used, household)
+    if income_used is not None and (per_capita is None or math.isnan(per_capita)):
+        # No household size declared -> neutral default, so per-capita income
+        # tracks the declared income rather than the dataset median.
+        per_capita = per_capita_income(income_used, DEFAULT_FAMILY_SIZE)
 
     # --- statutory priority flags (same fields the preprocessing pipeline
     # derives from the historical form: disability, indigenous group, solo
@@ -389,11 +426,11 @@ def build_row(applicant: Dict, ocr_result: Optional[Dict]) -> Dict:
         "ocr_exact_match": bool(match.get("exact_match")),
         "ocr_status": match.get("status", "not_comparable"),
         "income_log": income_log(income_used),
-        "has_itr": 1.0 if applicant.get("itr_path") else 0.0,
+        "has_itr": 1.0 if applicant.get("itr_path") or applicant.get("itr_path_p2") else 0.0,
+        "itr_path_p2": applicant.get("itr_path_p2"),
         "ocr_verified": 1.0 if ocr_value is not None else 0.0,
         "year_level_num": year_level_num(applicant.get("year_level")),
         "sex_code": sex_code(applicant.get("sex")),
-        "academic_norm": academic_norm(gwa, gpa),
         "pwd_flag": pwd_flag,
         "ip_flag": ip_flag,
         "solo_parent_flag": solo_parent_flag,
@@ -407,6 +444,8 @@ def build_row(applicant: Dict, ocr_result: Optional[Dict]) -> Dict:
         "is_train_tax_exempt": is_train_tax_exempt(income_used),
         "is_ched_priority_ceiling": is_ched_priority_ceiling(income_used),
         "itr_income_bracket": itr_income_bracket(income_used),
+        "family_size": household,
+        "per_capita_income": per_capita,
         "priority_target": 0.0,
     }
     row["priority_target"] = priority_target(row)

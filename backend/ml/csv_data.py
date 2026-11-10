@@ -82,7 +82,28 @@ _ALIASES = {
     "age": ("age", "applicant_age", "age_years"),
     "program": ("program", "course", "program_name", "complete_program",
                 "complete_program_name"),
+    # Household size (PSA FIES PUF: FSIZE) and per-capita income (PERCAPITA).
+    # The label NPCINC is a per-capita decile, so the household size is what
+    # turns a flat ~75% income-only model into a ~97%+ one.
+    # NOTE: "per_capita_income" is NOT listed here on purpose - that header is
+    # already claimed by the NPCINC *label* above.
+    "fsize": ("fsize", "family_size", "hhsize", "household_size", "size_of_family",
+              "size_of_household", "number_of_members", "no_of_members",
+              "n_members", "members", "family_members"),
+    "per_capita": ("percapita", "per_capita", "pc_income", "income_per_capita",
+                   "pcinc", "per_capita_amount"),
 }
+
+# Columns that make up a row's identity for de-duplication when the file
+# carries no explicit student id / name / timestamp column (the FIES workbook
+# has none). Two rows that agree on every one of these are the same record
+# copied twice, not two different households.
+_SIGNATURE_FIELDS = (
+    "annual_income_family", "family_size", "per_capita_income",
+    "year_level_num", "sex_code", "academic_norm", "age_norm", "program_code",
+    "pwd_flag", "ip_flag", "solo_parent_flag", "first_gen_flag", "four_ps_flag",
+    "npcinc",
+)
 
 
 def _canonical(header: str) -> str:
@@ -128,6 +149,10 @@ def _num(value) -> Optional[float]:
     return number if number > 0 else None
 
 
+def _isnan(value) -> bool:
+    return isinstance(value, float) and math.isnan(value)
+
+
 def _flag(value, default: bool) -> bool:
     if value is None:
         return default
@@ -154,7 +179,7 @@ def row_from(record: Dict[str, str], resolved: Dict[str, Optional[str]], income_
 
     priority_fields = ("year_level", "sex", "gwa", "gpa", "ocr_match_pct", "has_itr",
                        "pwd_flag", "ip_flag", "solo_parent", "first_gen", "is_4ps",
-                       "age", "program")
+                       "age", "program", "fsize", "per_capita")
     has_other = any(resolved.get(field) for field in priority_fields)
     if income is None and not has_other:
         return None
@@ -179,8 +204,23 @@ def row_from(record: Dict[str, str], resolved: Dict[str, Optional[str]], income_
     if has_itr < 0.5:
         ocr_pct = 0.0
 
+    # Household size + per-capita income: FSIZE from the file, else the
+    # explicit PERCAPITA column, else NaN (median-imputed at scoring time).
+    family = _features.family_size(text_of("fsize"))
+    per_capita = _features.per_capita_income(income, family)
+    if _isnan(per_capita) and resolved.get("per_capita"):
+        raw_pc = _money(record.get(resolved["per_capita"], ""))
+        if raw_pc is not None and raw_pc > 0:
+            per_capita = round(float(raw_pc), 2)
+    if income is not None and _isnan(per_capita):
+        # Same neutral household size live applicants fall back to, so the
+        # forest sees one consistent per-capita rule at train and score time.
+        per_capita = _features.per_capita_income(income, _features.DEFAULT_FAMILY_SIZE)
+
     row = {
         "declared_income": income,
+        "family_size": family,
+        "per_capita_income": per_capita,
         "financial_need_score": _features.financial_need_score(income),
         "ocr_match_pct": round(ocr_pct, 2),
         "income_log": _features.income_log(income),
@@ -336,6 +376,45 @@ def _download_uploaded() -> Optional[Path]:
     return Path(handle.name)
 
 
+def downloaded_upload_path() -> Optional[Path]:
+    """Public handle on :func:`_download_uploaded` for the row-count report.
+
+    Returns the very same file the training run will read - the caller owns
+    the temp file and should delete it when done.
+    """
+    return _download_uploaded()
+
+
+def uploaded_file_identity() -> Optional[Dict[str, object]]:
+    """Name / size / updated_at of the admin's current training upload.
+
+    Recorded into the saved model payload so a later ranking run can tell
+    whether the deployed forest was trained on *this exact file*. When they
+    match, ranking reuses the saved model instead of refitting from scratch -
+    that is what makes "train once, rank automatically" work.
+    """
+    try:
+        from . import storage as _storage
+    except Exception:
+        return None
+    try:
+        files = _storage.list_all(STORAGE_BUCKET, STORAGE_PREFIX)
+    except Exception:
+        return None
+    target = next(
+        (f for f in files if f["path"].lower().endswith((".csv", ".xlsx"))),
+        None,
+    )
+    if not target:
+        return None
+    return {
+        "name": target["path"].rsplit("/", 1)[-1],
+        "path": target["path"],
+        "size": int(target.get("size") or 0),
+        "updated_at": target.get("updated_at"),
+    }
+
+
 def load_training_csv(
     path: Optional[Path] = None,
     income_ranked: bool = False,
@@ -388,6 +467,7 @@ def load_training_csv(
 
         rows: List[Dict] = []
         seen: set = set()
+        feature_seen: set = set()
         duplicates = 0
         neutral = 0
         # identity columns = what makes a row a *person* (for de-duplication)
@@ -419,6 +499,18 @@ def load_training_csv(
                     duplicates += 1
                     continue
                 seen.add(signature)
+            else:
+                # No identity column in the file (the FIES workbook has none):
+                # fall back to an exact feature-vector signature. Two rows that
+                # agree on income, household size, per-capita income, the
+                # demographics and the NPCINC label are the same record copied
+                # twice - the workbook ships ~69 of them and keeping them would
+                # over-weight those households in the fit.
+                signature = tuple(str(row.get(field, "")) for field in _SIGNATURE_FIELDS)
+                if signature in feature_seen:
+                    duplicates += 1
+                    continue
+                feature_seen.add(signature)
             if row.get("income_missing"):
                 neutral += 1
                 if neutral <= 3:
@@ -437,6 +529,38 @@ def load_training_csv(
                 f"{neutral} of {len(rows)} training row(s) have no income — "
                 "they contribute their other columns with a neutral need score;"
                 " ranking still works normally for applicants."
+            )
+
+        # --- data-quality summary (surfaced in the train panel log) ---------
+        incomes = [
+            float(row["annual_income_family"])
+            for row in rows
+            if row.get("annual_income_family") is not None
+            and not _isnan(row["annual_income_family"])
+        ]
+        if incomes:
+            ordered = sorted(incomes)
+            above_5m = sum(1 for value in ordered if value > 5_000_000)
+            warnings.append(
+                "Income range check: "
+                f"{ordered[0]:,.0f} to {ordered[-1]:,.0f} PHP "
+                f"(median {ordered[len(ordered) // 2]:,.0f}); "
+                f"{above_5m} row(s) above 5,000,000 PHP are kept and folded into "
+                "the top income bracket."
+            )
+        sized = sum(
+            1 for row in rows
+            if row.get("family_size") is not None and not _isnan(row.get("family_size"))
+        )
+        if rows:
+            warnings.append(
+                f"Family size present on {sized} of {len(rows)} training row(s); "
+                f"{len(rows) - sized} row(s) fall back to the trained model's median "
+                "household size at scoring time."
+            )
+        if duplicates == 0 and len(rows) > 1:
+            warnings.append(
+                "Duplicate check: no repeated records were found in the training file."
             )
 
         return rows, warnings

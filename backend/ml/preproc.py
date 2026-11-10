@@ -157,6 +157,8 @@ def build_candidates(rgb: np.ndarray, include_deskew: bool = True) -> Generator[
     yield {"name": "original", "array": rgb, "steps": ["decode"]}
     max_candidates = _config.OCR_MAX_VARIANTS + 1
     yielded = 1
+    if yielded >= max_candidates:
+        return
 
     upscaled = upscale(rgb)
     if upscaled.shape[:2] != rgb.shape[:2]:
