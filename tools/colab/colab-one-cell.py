@@ -85,14 +85,48 @@ def itr_income_bracket(income):
             return float(label)
     return 7.0
 
-def fies_features(income):
-    """The five PSA FIES columns, shared by every row builder here."""
+DEFAULT_FAMILY_SIZE = 4.0   # FIES mean household size (FSIZE = 4.07)
+
+def family_size(value):
+    """Household members -> 1.0..20.0, else the neutral default (4)."""
+    if value is None:
+        return DEFAULT_FAMILY_SIZE
+    if str(value).strip() == "":
+        return DEFAULT_FAMILY_SIZE
+    try:
+        size = float(str(value).strip().replace(",", ""))
+    except (TypeError, ValueError):
+        return DEFAULT_FAMILY_SIZE
+    if not (1.0 <= size <= 20.0):
+        return DEFAULT_FAMILY_SIZE
+    return size
+
+def per_capita_income(income, size):
+    if income is None or size is None:
+        return float("nan")
+    try:
+        members = float(size)
+    except (TypeError, ValueError):
+        return float("nan")
+    if math.isnan(members) or members <= 0:
+        return float("nan")
+    return round(float(income) / members, 2)
+
+def fies_features(income, household=None):
+    """The seven PSA FIES columns, shared by every row builder here.
+
+    family_size defaults to the FIES mean (4) when the caller has no FSIZE
+    value, so per-capita income still follows income instead of becoming NaN.
+    """
+    size = family_size(household)
     return {
         "annual_income_family": income if income is not None else float("nan"),
         "monthly_income_equiv": monthly_income_equiv(income),
         "is_train_tax_exempt": is_train_tax_exempt(income),
         "is_ched_priority_ceiling": is_ched_priority_ceiling(income),
         "itr_income_bracket": itr_income_bracket(income),
+        "family_size": size,
+        "per_capita_income": per_capita_income(income, size),
     }
 
 def priority_target(row):
@@ -106,7 +140,8 @@ def priority_target(row):
 FEATURE_COLUMNS = ["financial_need_score", "ocr_match_pct", "income_log", "has_itr",
                    "ocr_verified", "year_level_num", "sex_code", "academic_norm",
                    "annual_income_family", "monthly_income_equiv", "is_train_tax_exempt",
-                   "is_ched_priority_ceiling", "itr_income_bracket"]
+                   "is_ched_priority_ceiling", "itr_income_bracket",
+                   "family_size", "per_capita_income"]
 
 def matrix(rows, medians=None):
     if medians is None:
