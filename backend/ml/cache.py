@@ -14,7 +14,14 @@ from typing import Dict, Optional
 from . import config as _config
 
 CACHE_PATH = _config.MODEL_DIR / "ocr_cache.json"
-VERSION = 9
+# Bump this whenever the OCR *reading* algorithm changes (new layout boxes,
+# a different digit reader, another threshold pass, ...). The version is part
+# of every cache key, so a stale result produced by older code is never
+# reused - the scan simply runs again. v9 entries written before the
+# 1701-MS layout-cell reader was working still said "no income detected" for
+# ITRs that the current reader parses correctly, which made the ranking show
+# "OCR unavailable" on applicants whose ITR was fine.
+VERSION = 10
 
 
 def _key(path: str, size, updated_at) -> str:
